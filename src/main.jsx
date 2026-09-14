@@ -5028,89 +5028,575 @@ const AppBottomBranding = () => {
                   />
                 )}
                 {tab === 'records' && <RecordsView onSelectTransaction={setSelectedTransaction} />}
-              </>
-            )}
+import React, { useState, useEffect, useMemo, useRef, createContext, useContext } from 'react';
+import ReactDOM from 'react-dom/client';
+import html2canvas from 'html2canvas';
+import html2pdf from 'html2pdf.js';
+
+// Import extracted constants
+import { 
+  INCOME_TYPES, 
+  SELECT_STYLE, 
+  MONTHS_SHORT, 
+  APP_ICON_WHITE, 
+  APP_LOGO_COLORED, 
+  APP_LOGO_WHITE 
+} from './constants';
+
+// Import SQLite backend bridge
+import { initDB, BackendBridge } from './db.js';
+
+// Import Tailwind CSS
+import './index.css';
+
+// Helper to safely join array-based Base64 assets
+const resolveImg = (src) => (Array.isArray(src) ? src.join('') : (src || ''));
+
+const AppBottomBranding = () => {
+  const handleWhatsAppDeveloper = (e) => {
+    e.preventDefault();
+    const phone = '917218838122';
+    const textMsg = 'Hi Bharat, i need help regarding..';
+    const waUrl = `https://wa.me/${phone}?text=${encodeURIComponent(textMsg)}`;
+    window.open(waUrl, '_blank', 'noopener,noreferrer');
+  };
+
+  return (
+    <div className="pt-6 pb-2 text-center flex flex-col items-center justify-center select-none">
+      <img
+        src={resolveImg(APP_LOGO_COLORED)}
+        alt="Budget Bharat"
+        className="h-[31px] object-contain mb-1.5 drop-shadow-sm"
+      />
+      <p className="text-[10px] font-bold text-[#625E70] tracking-wide mb-2.5">
+        Developed by - Bharat Rasve © 2026
+      </p>
+      <div className="flex items-center justify-center gap-2">
+        <button
+          type="button"
+          onClick={() => {
+            window.location.href = `tel:0${String(7218838122 || '').replace(/\D/g, '').slice(-10)}`;
+          }}
+          title="Call Developer"
+          className="w-9 h-9 flex items-center justify-center text-[#1E104B] hover:opacity-70 active:scale-90 transition-all"
+        >
+          <i className="fa-solid fa-phone text-[13px]"></i>
+        </button>
+
+        <button
+          type="button"
+          onClick={handleWhatsAppDeveloper}
+          title="WhatsApp Developer"
+          className="w-9 h-9 flex items-center justify-center text-[#1E104B] hover:opacity-70 active:scale-90 transition-all"
+        >
+          <i className="fa-brands fa-whatsapp text-base"></i>
+        </button>
+
+        <a
+          href="https://www.linkedin.com/in/bharatrasve"
+          target="_blank"
+          rel="noopener noreferrer"
+          title="LinkedIn"
+          className="w-9 h-9 flex items-center justify-center text-[#1E104B] hover:opacity-70 active:scale-90 transition-all"
+        >
+          <i className="fa-brands fa-linkedin-in text-sm"></i>
+        </a>
+
+        <a
+          href="https://github.com/bharombhar"
+          target="_blank"
+          rel="noopener noreferrer"
+          title="GitHub"
+          className="w-9 h-9 flex items-center justify-center text-[#1E104B] hover:opacity-70 active:scale-90 transition-all"
+        >
+          <i className="fa-brands fa-github text-sm"></i>
+        </a>
+
+        <a
+          href="https://www.instagram.com/bharat_rasve_?r=nametag"
+          target="_blank"
+          rel="noopener noreferrer"
+          title="Instagram"
+          className="w-9 h-9 flex items-center justify-center text-[#1E104B] hover:opacity-70 active:scale-90 transition-all"
+        >
+          <i className="fa-brands fa-instagram text-sm"></i>
+        </a>
+
+        <a
+          href="https://bharatrasve.blogspot.com/"
+          target="_blank"
+          rel="noopener noreferrer"
+          title="Website"
+          className="w-9 h-9 flex items-center justify-center text-[#1E104B] hover:opacity-70 active:scale-90 transition-all"
+        >
+          <i className="fa-solid fa-globe text-sm"></i>
+        </a>
+      </div>
+    </div>
+  );
+};
+
+const formatMoney = (val) => new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', minimumFractionDigits: 0 }).format(val || 0);
+const formatTableNum = (val) => new Intl.NumberFormat('en-IN', { minimumFractionDigits: 0, maximumFractionDigits: 0 }).format(Math.abs(val || 0));
+const toProperCase = (str) => {
+  if (!str) return '';
+  return str.toLowerCase().replace(/\b\w/g, (char) => char.toUpperCase());
+};
+
+const parseDate = (dStr) => {
+  if (!dStr) return new Date(0);
+  if (dStr instanceof Date) return dStr;
+  const s = String(dStr).trim();
+  const m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/);
+  if (m) {
+    const day = parseInt(m[1], 10);
+    const month = parseInt(m[2], 10) - 1;
+    const year = m[3].length === 2 ? parseInt('20' + m[3], 10) : parseInt(m[3], 10);
+    return new Date(year, month, day);
+  }
+  const parsed = new Date(s);
+  return isNaN(parsed.getTime()) ? new Date(0) : parsed;
+};
+
+const toInputDate_ = (dStr) => {
+  if (!dStr) return '';
+  if (dStr instanceof Date) {
+    const y = dStr.getFullYear();
+    const m = ('0' + (dStr.getMonth() + 1)).slice(-2);
+    const d = ('0' + dStr.getDate()).slice(-2);
+    return `${y}-${m}-${d}`;
+  }
+  const s = String(dStr).trim();
+  const m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/);
+  if (m) {
+    const day = ('0' + m[1]).slice(-2);
+    const month = ('0' + m[2]).slice(-2);
+    const year = m[3].length === 2 ? ('20' + m[3]) : m[3];
+    return `${year}-${month}-${day}`;
+  }
+  return '';
+};
+
+const formatDisplayDate = (dStr) => {
+  if (!dStr) return '-';
+  let day, monthIdx, yy;
+  if (dStr instanceof Date) {
+    day = dStr.getDate();
+    monthIdx = dStr.getMonth();
+    yy = String(dStr.getFullYear()).slice(-2);
+  } else {
+    const s = String(dStr).trim();
+    const m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/);
+    if (m) {
+      day = parseInt(m[1], 10);
+      monthIdx = parseInt(m[2], 10) - 1;
+      yy = m[3].length === 4 ? m[3].slice(-2) : m[3];
+    } else {
+      const d = new Date(s);
+      if (isNaN(d.getTime())) return dStr;
+      day = d.getDate();
+      monthIdx = d.getMonth();
+      yy = String(d.getFullYear()).slice(-2);
+    }
+  }
+  if (isNaN(day) || monthIdx < 0 || monthIdx > 11) return dStr;
+  return `${day}-${MONTHS_SHORT[monthIdx]}-${yy}`;
+};
+
+const gasRun = async (fnName, ...args) => {
+  try {
+    if (BackendBridge && BackendBridge[fnName]) {
+      return await BackendBridge[fnName](...args);
+    } else {
+      console.warn(`Function ${fnName} not implemented in SQLite bridge yet.`);
+      return null;
+    }
+  } catch (err) {
+    throw err;
+  }
+};
+
+const downloadCsv = (csv, filename) => {
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+};
+
+const exportToImage = async (ref, filename) => {
+  const target = ref && ref.current ? ref.current : (typeof ref === 'string' ? document.getElementById(ref) : ref);
+  if (!target) return;
+  try {
+    const canvas = await html2canvas(target, { 
+      backgroundColor: '#ffffff', 
+      scale: 2.5, 
+      logging: false, 
+      useCORS: true 
+    });
+    const link = document.createElement('a');
+    link.download = `${filename}.png`;
+    link.href = canvas.toDataURL('image/png');
+    link.click();
+  } catch (e) { 
+    console.error("Export failed", e); 
+  }
+};
+
+const shareReceiptToWhatsApp = async (ref, filename, captionText) => {
+  let target = ref && ref.current ? ref.current : (typeof ref === 'string' ? document.getElementById(ref) : ref);
+  if (!target) throw new Error("Target render reference not found");
+
+  if (target instanceof HTMLElement === false && target.nodeType !== 1) {
+    target = target.current || target;
+  }
+
+  if (document.fonts && document.fonts.ready) {
+    try { await document.fonts.ready; } catch (e) { /* non-fatal */ }
+  }
+
+  const targetWidth = parseInt(target && target.style ? target.style.width : 0, 10) || Math.ceil((target && target.getBoundingClientRect ? target.getBoundingClientRect().width : 0) || target.offsetWidth) || 640;
+  const targetHeight = Math.ceil((target && target.getBoundingClientRect ? target.getBoundingClientRect().height : 0) || target.offsetHeight || target.scrollHeight);
+
+  const dynamicScale = targetHeight > 2500 ? 1.2 : targetHeight > 1500 ? 1.5 : 2;
+
+  let canvas;
+  try {
+    canvas = await html2canvas(target, { 
+      backgroundColor: '#ffffff', 
+      scale: dynamicScale, 
+      logging: false, 
+      useCORS: true, 
+      allowTaint: true,
+      foreignObjectRendering: false,
+      letterRendering: false,
+      width: targetWidth,
+      height: targetHeight,
+      windowWidth: targetWidth,
+      windowHeight: targetHeight,
+      scrollY: 0,
+      scrollX: 0
+    });
+  } catch (canvasErr) {
+    throw new Error("Statement is too long to export as a single image on this device.");
+  }
+
+  const blob = await new Promise((resolve, reject) => {
+    canvas.toBlob((b) => {
+      if (b) resolve(b);
+      else reject(new Error("Canvas blob generation failed"));
+    }, 'image/jpeg', 0.85);
+  });
+
+  if (!blob) throw new Error("Empty image blob created");
+
+  const file = new File([blob], `${filename}.jpg`, { type: 'image/jpeg' });
+
+  if (navigator.canShare && navigator.canShare({ files: [file] })) {
+    try {
+      await navigator.share({
+        files: [file],
+        title: filename,
+        text: captionText
+      });
+      return true;
+    } catch (err) {
+      if (err.name === 'AbortError') return true;
+      if (err.name === 'NotAllowedError') {
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
+        link.download = `${filename}.jpg`;
+        link.click();
+        URL.revokeObjectURL(link.href);
+        return true;
+      }
+      throw err;
+    }
+  } else {
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = `${filename}.jpg`;
+    link.click();
+    URL.revokeObjectURL(link.href);
+    return true;
+  }
+};
+
+const waitForPaint = () => new Promise(resolve => {
+  requestAnimationFrame(() => requestAnimationFrame(resolve));
+});
+
+const AppContext = createContext();
+
+const AppProvider = ({ children }) => {
+  const [transactions, setTransactions] = useState([]);
+  const [persons, setPersons] = useState([]);
+  const [loans, setLoans] = useState([]);
+  const [categories, setCategories] = useState({ expense: [], income: [] });
+  const [admin, setAdmin] = useState({ name: '', contact: '', email: '', headerNote: '', footerNote: '' });
+
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState('');
+  const [syncStatus, setSyncStatus] = useState('syncing');
+  const [searchQuery, setSearchQuery] = useState('');
+
+  const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const [menuView, setMenuView] = useState('menu');
+
+  const [toast, setToast] = useState({ show: false, msg: '' });
+
+  const [filterPeriod, setFilterPeriod] = useState('All');
+  const [customFrom, setCustomFrom] = useState('');
+  const [customTo, setCustomTo] = useState('');
+  const [directoryFilter, setDirectoryFilter] = useState('ALL');
+
+  const showFeedback = (msg) => {
+    setToast({ show: true, msg });
+    setTimeout(() => setToast({ show: false, msg: '' }), 3000);
+  };
+
+  const applyPayload = (payload) => {
+    if (!payload) return;
+    setTransactions(payload.transactions || []);
+    setPersons(payload.persons || []);
+    setLoans(payload.loans || []);
+    setCategories(payload.categories || { expense: [], income: [] });
+    setAdmin(payload.admin || { name: '', contact: '', email: '', headerNote: '', footerNote: '' });
+  };
+
+  const saveLoanAction = (loanData) => {
+    return gasRun('saveLoan', loanData)
+      .then((payload) => { applyPayload(payload); showFeedback('Loan updated'); })
+      .catch((err) => { showFeedback('Save failed: ' + err.message); throw err; });
+  };
+
+  const deleteLoanAction = (loanId) => {
+    return gasRun('deleteLoan', loanId)
+      .then((payload) => { applyPayload(payload); showFeedback('Loan deleted'); })
+      .catch((err) => { showFeedback('Delete failed: ' + err.message); throw err; });
+  };
+
+  const refresh = (verbose = false, force = false) => {
+    setLoading(true);
+    setSyncStatus('syncing');
+    gasRun('getDashboardPayload', force)
+      .then((payload) => {
+        applyPayload(payload);
+        setLoadError('');
+        if (verbose) showFeedback('Data synced');
+      })
+      .catch((err) => setLoadError(String(err && err.message ? err.message : err)))
+      .finally(() => { setLoading(false); setSyncStatus('idle'); });
+  };
+
+  useEffect(() => { refresh(false, false); }, []);
+
+  const addTransaction = (tx) => {
+    const typeLabel = tx.type === 'BORROW' ? 'Received' : tx.type === 'LENT' ? 'Given' : tx.type === 'EXPENSE' ? 'Expense' : 'Income';
+    return gasRun('addTransaction', tx)
+      .then((payload) => { 
+        if (payload) applyPayload(payload); 
+        showFeedback(`${typeLabel} entry saved`); 
+      })
+      .catch((err) => { showFeedback('Save failed: ' + err.message); throw err; });
+  };
+
+  const deleteTransaction = (id) => {
+    const targetId = typeof id === 'object' ? String(id.id || id.entryId || '').trim() : String(id || '').trim();
+    return gasRun('deleteTransaction', targetId)
+      .then((payload) => {
+        if (payload && payload.transactions) {
+          applyPayload(payload);
+        } else {
+          setTransactions(prev => prev.filter(t => String(t.id || t.entryId).trim() !== targetId));
+        }
+        showFeedback('Transaction deleted');
+      })
+      .catch((err) => {
+        refresh(false, true);
+        showFeedback('Delete failed: ' + (err && err.message ? err.message : String(err)));
+        throw err;
+      });
+  };
+
+  const addPerson = (p) => {
+    return gasRun('addPerson', p)
+      .then((payload) => { 
+        if (payload) applyPayload(payload); 
+        showFeedback('Person Added to Directory'); 
+      })
+      .catch((err) => { showFeedback('Save failed: ' + err.message); throw err; });
+  };
+
+  const updatePerson = (p) => {
+    return gasRun('updatePerson', p)
+      .then((payload) => { 
+        if (payload) applyPayload(payload); 
+        showFeedback('Person & transactions updated'); 
+      })
+      .catch((err) => { showFeedback('Update failed: ' + err.message); throw err; });
+  };
+
+  const deletePerson = (personName) => {
+    return gasRun('deletePerson', personName)
+      .then((payload) => { 
+        if (payload && payload.persons) {
+          applyPayload(payload);
+        } else {
+          setPersons(prev => prev.filter(p => p.name !== personName));
+          setTransactions(prev => prev.filter(t => t.person !== personName));
+        }
+        showFeedback('Person & related entries deleted'); 
+      })
+      .catch((err) => { 
+        refresh(false, true);
+        showFeedback('Delete failed: ' + (err && err.message ? err.message : String(err))); 
+        throw err; 
+      });
+  };
+
+  const addCategory = (type, name) => {
+    return gasRun('addCategory', type, name)
+      .then((payload) => { 
+        if (payload) applyPayload(payload); 
+        showFeedback('Category Added'); 
+      })
+      .catch((err) => { showFeedback('Save failed: ' + err.message); throw err; });
+  };
+
+  const updateCategory = (oldData, newData) => {
+    return gasRun('updateCategory', oldData, newData)
+      .then((payload) => { 
+        if (payload) applyPayload(payload); 
+        showFeedback('Category Updated'); 
+      })
+      .catch((err) => { showFeedback('Update failed: ' + err.message); throw err; });
+  };
+
+  const deleteCategory = (catData) => {
+    return gasRun('deleteCategory', catData)
+      .then((payload) => { 
+        if (payload) applyPayload(payload); 
+        showFeedback('Category Deleted'); 
+      })
+      .catch((err) => { showFeedback('Delete failed: ' + err.message); throw err; });
+  };
+
+  const updateAdminConfig = (adminData) => {
+    return gasRun('updateAdminConfig', adminData)
+      .then((payload) => { 
+        if (payload) applyPayload(payload); 
+        showFeedback('Admin settings saved'); 
+      })
+      .catch((err) => { showFeedback('Save failed: ' + err.message); throw err; });
+  };
+
+  const syncData = () => { refresh(true, true); };
+
+  const exportCsv = (rpcFn, filename) => {
+    showFeedback('Preparing export...');
+    gasRun(rpcFn)
+      .then((csv) => { downloadCsv(csv, filename); showFeedback('Exported ' + filename); })
+      .catch((err) => showFeedback('Export failed: ' + err.message));
+  };
+
+  const filteredTransactions = useMemo(() => {
+    if (filterPeriod === 'All' || filterPeriod === 'All Time') return transactions;
+
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+    return transactions.filter(t => {
+      const d = parseDate(t.date);
+      if (filterPeriod === 'Today') return d.getFullYear() === today.getFullYear() && d.getMonth() === today.getMonth() && d.getDate() === today.getDate();
+      if (filterPeriod === 'Week') {
+        const start = new Date(today);
+        start.setDate(today.getDate() - today.getDay());
+        return d >= start && d <= today;
+      }
+      if (filterPeriod === 'Month') return d.getMonth() === today.getMonth() && d.getFullYear() === today.getFullYear();
+      if (filterPeriod === 'Qtr') {
+        const q = Math.floor(today.getMonth() / 3);
+        return Math.floor(d.getMonth() / 3) === q && d.getFullYear() === today.getFullYear();
+      }
+      if (filterPeriod === 'Year') return d.getFullYear() === today.getFullYear();
+      if (filterPeriod === 'Custom' && customFrom && customTo) {
+        const f = parseDate(customFrom);
+        const tDate = parseDate(customTo);
+        tDate.setHours(23, 59, 59, 999);
+        return d >= f && d <= tDate;
+      }
+      return true;
+    });
+  }, [transactions, filterPeriod, customFrom, customTo]);
+
+  const updateTransaction = (tx) => {
+    return gasRun('updateTransaction', tx)
+      .then((payload) => { 
+        if (payload) applyPayload(payload); 
+        showFeedback('Transaction updated'); 
+      })
+      .catch((err) => { showFeedback('Update failed: ' + err.message); throw err; });
+  };
+
+  return (
+    <AppContext.Provider value={{
+      transactions, filteredTransactions, persons, loans, categories, admin, loading, loadError, syncStatus,
+      searchQuery, setSearchQuery,
+      isMenuOpen, setIsMenuOpen, menuView, setMenuView,
+      filterPeriod, setFilterPeriod, customFrom, setCustomFrom, customTo, setCustomTo,
+      directoryFilter, setDirectoryFilter,
+      addTransaction, updateTransaction, deleteTransaction, addPerson, updatePerson, deletePerson, addCategory, updateCategory, deleteCategory, updateAdminConfig,
+      saveLoanAction, deleteLoanAction,
+      syncData, exportCsv, refresh, showFeedback
+    }}>
+      {children}
+      {toast.show && (
+        <div className="fixed bottom-24 left-0 right-0 flex justify-center z-50 toast-enter pointer-events-none">
+          <div className="bg-theme-dark text-white px-5 py-2.5 rounded-full shadow-2xl flex items-center gap-2.5 text-xs font-bold tracking-wide">
+            <i className="fa-solid fa-circle-check text-emerald-400 text-sm"></i>
+            {toast.msg}
           </div>
+        </div>
+      )}
+    </AppContext.Provider>
+  );
+};
 
-          {showInput && <InputModal onClose={() => setShowInput(false)} />}
-          {selectedTransaction && <TransactionDetailModal tx={selectedTransaction} onClose={() => setSelectedTransaction(null)} />}
+const AppDatePicker = ({ value, onChange, required = false, className = '', style = {} }) => {
+  const inputRef = useRef(null);
+  const lockRef = useRef(false);
 
-          {/* Notched Orbit Navigation Bar */}
-          <div className="notched-nav-container select-none">
-            <div className="notched-pill">
-              <div className="flex items-center gap-7 sm:gap-9 pr-4">
-                <button
-                  onClick={() => setTab('home')}
-                  className={`p-2 transition-all flex flex-col items-center active:scale-90 ${tab === 'home' ? 'text-[#07C0BE]' : 'text-white/50 hover:text-white'}`}
-                  title="Home"
-                >
-                  <i className="fa-solid fa-house text-lg"></i>
-                  {tab === 'home' && (
-                    <span
-                      className="w-5 h-[1px] rounded-full bg-[#07C0BE] mt-1.5"
-                      style={{ boxShadow: '0 -5px 12px 2.5px rgba(7, 192, 190, 0.55), 0 0 4px 1px rgba(7, 192, 190, 0.85)' }}
-                    ></span>
-                  )}
-                </button>
-                <button
-                  onClick={() => setTab('people')}
-                  className={`p-2 transition-all flex flex-col items-center active:scale-90 ${tab === 'people' ? 'text-[#07C0BE]' : 'text-white/50 hover:text-white'}`}
-                  title="Directory"
-                >
-                  <i className="fa-solid fa-users text-lg"></i>
-                  {tab === 'people' && (
-                    <span
-                      className="w-5 h-[1px] rounded-full bg-[#07C0BE] mt-1.5"
-                      style={{ boxShadow: '0 -5px 12px 2.5px rgba(7, 192, 190, 0.55), 0 0 4px 1px rgba(7, 192, 190, 0.85)' }}
-                    ></span>
-                  )}
-                </button>
-                <button
-                  onClick={() => setTab('loans')}
-                  className={`p-2 transition-all flex flex-col items-center active:scale-90 ${tab === 'loans' ? 'text-[#07C0BE]' : 'text-white/50 hover:text-white'}`}
-                  title="Loans / EMIs"
-                >
-                  <i className="fa-solid fa-hand-holding-dollar text-lg"></i>
-                  {tab === 'loans' && (
-                    <span
-                      className="w-5 h-[1px] rounded-full bg-[#07C0BE] mt-1.5"
-                      style={{ boxShadow: '0 -5px 12px 2.5px rgba(7, 192, 190, 0.55), 0 0 4px 1px rgba(7, 192, 190, 0.85)' }}
-                    ></span>
-                  )}
-                </button>
-                <button
-                  onClick={() => setTab('records')}
-                  className={`p-2 transition-all flex flex-col items-center active:scale-90 ${tab === 'records' ? 'text-[#07C0BE]' : 'text-white/50 hover:text-white'}`}
-                  title="Records"
-                >
-                  <i className="fa-solid fa-receipt text-lg"></i>
-                  {tab === 'records' && (
-                    <span
-                      className="w-5 h-[1px] rounded-full bg-[#07C0BE] mt-1.5"
-                      style={{ boxShadow: '0 -5px 12px 2.5px rgba(7, 192, 190, 0.55), 0 0 4px 1px rgba(7, 192, 190, 0.85)' }}
-                    ></span>
-                  )}
-                </button>
-              </div>
-            </div>
+  const handleChange = (e) => {
+    const val = e.target.value;
+    onChange(val);
+    if (inputRef.current) {
+      lockRef.current = true;
+      inputRef.current.blur();
+      setTimeout(() => { lockRef.current = false; }, 450);
+    }
+  };
 
-            <button
-              onClick={() => setShowInput(true)}
-              title="Add New Entry"
-              className="notched-fab"
-            >
-              <span className="relative w-8 h-8 flex items-center justify-center">
-  <img
-    src={APP_ICON_WHITE}
-    alt="Budget Bharat"
-    className={`absolute w-8 h-8 object-contain transition-all duration-700 ${
-      fabShowingAppIcon
-        ? 'opacity-100 scale-100 rotate-0'
-        : 'opacity-0 scale-75 rotate-90'
-    }`}
-  />
+  const handleBlock = (e) => {
+    if (lockRef.current) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  };
 
-  <span
+  return (
+    <div onClick={e => e.stopPropagation()} onTouchStart={handleBlock} onPointerDown={handleBlock} className="relative w-full">
+      <input
+        ref={inputRef}
+        type="date"
+        required={required}
+        value={value || ''}
+        style={{ colorScheme: 'light', touchAction: 'manipulation', ...style }}
+   
     aria-hidden="true"
     className={`fab-heavy-plus absolute transition-all duration-700 ${
       fabShowingAppIcon
