@@ -32,9 +32,10 @@ jobs:
       - name: Build Web Assets (Vite)
         run: npm run build
 
-      - name: Initialize Android Platform via Capacitor
+      - name: Initialize Android Platform and Generate Assets
         run: |
           npx cap add android
+          npx @capacitor/assets generate --android
           npx cap sync android
 
       - name: Build Android Debug APK
