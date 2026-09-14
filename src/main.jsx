@@ -176,9 +176,7 @@ const AppBottomBranding = () => {
       return `${day}-${MONTHS_SHORT[monthIdx]}-${yy}`;
     };
 
-    // Ensure DB is initialized before React loads
-    import { initDB, BackendBridge } from './src/db.js';
-    
+      
     const gasRun = async (fnName, ...args) => {
       try {
         if (BackendBridge[fnName]) {
