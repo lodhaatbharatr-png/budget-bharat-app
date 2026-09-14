@@ -29,6 +29,7 @@
     "vite": "^5.4.2"
   },
   "capacitor-assets": {
-    "input": "assets/icon.png"
+    "input": "assets/icon.png",
+    "background": "#1E104B"
   }
 }
