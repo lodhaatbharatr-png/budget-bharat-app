@@ -5125,8 +5125,10 @@ const AppBottomBranding = () => {
       );
     };
 
+    initDB().then(() => {
     ReactDOM.createRoot(document.getElementById('root')).render(
       <AppProvider>
         <MainApp />
       </AppProvider>
     );
+});
