@@ -1,63 +1,29 @@
-import React, { useState, useEffect, useMemo, useRef, createContext, useContext } from 'react';
-import ReactDOM from 'react-dom/client';
+import React, {
+  useState,
+  useEffect,
+  useMemo,
+  createContext,
+  useContext,
+  useRef
+} from 'react';
+import { createPortal } from 'react-dom';
+import { createRoot } from 'react-dom/client';
 import html2canvas from 'html2canvas';
 import html2pdf from 'html2pdf.js';
+import { Capacitor } from '@capacitor/core';
+import { CapacitorSQLite, SQLiteConnection } from '@capacitor-community/sqlite';
 
-// Import your newly extracted constants
-import { 
-  INCOME_TYPES, 
-  SELECT_STYLE, 
-  MONTHS_SHORT, 
-  APP_ICON_WHITE, 
-  APP_LOGO_COLORED, 
-  APP_LOGO_WHITE 
-} from './constants';
+const INCOME_TYPES = ['INCOME', 'BORROW'];
+const SELECT_STYLE = { colorScheme: 'light' };
+const MONTHS_SHORT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
-// Import your SQLite backend bridge
-import { initDB, BackendBridge } from './db.js';
+// Use the repository asset instead of embedding logo/icon data as Base64.
+import appIcon from '../assets/icon.png';
+const APP_ICON_WHITE = appIcon;
+const APP_LOGO_COLORED = appIcon;
+const APP_LOGO_WHITE = appIcon;
 
-// Import Tailwind CSS
-import './index.css';
-
-// Contains a crash to the section it wraps instead of letting it bubble
-// up and blank the whole app. Give it a `key` that changes with whatever
-// it's protecting (e.g. key={tab}) so switching away and back clears a
-// past error automatically.
-class ErrorBoundary extends React.Component {
-  constructor(props) {
-    super(props);
-    this.state = { hasError: false, error: null };
-  }
-  static getDerivedStateFromError(error) {
-    return { hasError: true, error };
-  }
-  componentDidCatch(error, info) {
-    console.error('ErrorBoundary caught an error in "' + (this.props.label || 'section') + '":', error, info);
-  }
-  handleReset = () => {
-    this.setState({ hasError: false, error: null });
-    if (this.props.onReset) this.props.onReset();
-  };
-  render() {
-    if (this.state.hasError) {
-      return (
-        <div className="flex-1 flex flex-col items-center justify-center text-center p-6 space-y-3 min-h-[240px]">
-          <i className="fa-solid fa-triangle-exclamation text-3xl text-red-400"></i>
-          <p className="text-sm font-bold text-theme-dark">{this.props.label || 'This section'} hit a snag</p>
-          <p className="text-xs text-theme-dark/60 max-w-xs break-words">
-            {String((this.state.error && this.state.error.message) || this.state.error || 'Unknown error')}
-          </p>
-          <button onClick={this.handleReset} className="px-4 py-2 bg-theme-dark text-white rounded-xl text-xs font-bold shadow-md active:scale-95 transition-all">
-            Try Again
-          </button>
-        </div>
-      );
-    }
-    return this.props.children;
-  }
-}
-
-const AppBottomBranding = () => {
+    const AppBottomBranding = () => {
       const handleWhatsAppDeveloper = (e) => {
         e.preventDefault();
         const phone = '917218838122';
@@ -214,17 +180,717 @@ const AppBottomBranding = () => {
       return `${day}-${MONTHS_SHORT[monthIdx]}-${yy}`;
     };
 
-      
-    const gasRun = async (fnName, ...args) => {
+    const LOCAL_DB_NAME = 'budget_bharat';
+    const LOCAL_DB_VERSION = 1;
+    const LOCAL_STATE_KEY = 'budget_bharat_state_v1';
+
+    const LOCAL_HEADERS = {
+      transactions: ['ENTRY_ID', 'Timestamp', 'Transaction Type', 'Date', 'Amount', 'Person', 'Category', 'Description', 'Reference A/c', 'Promise Date', 'Updated At'],
+      persons: ['Person ID', 'Person', 'Mobile No.', 'ADDRESS', 'Email Id'],
+      categories: ['Expense Type', 'Income type'],
+      admin: ['NAME', 'CONTACT', 'Email id', 'Statement Header note', 'Statement Footer note'],
+      loans: ['Loan ID', 'Person', 'Loan Name', 'Loan Taken', 'Loan to Pay', 'Monthly EMI', 'Tenure Months', 'First EMI Date', 'Status'],
+      emi: ['Loan ID', 'EMI No', 'Date', 'EMI Amount', 'Outstanding Bal', 'Paid', 'Who Paid', 'Txn. Id', 'Paid Date']
+    };
+
+    const DEFAULT_LOCAL_STATE = {
+      transactions: [],
+      persons: [],
+      categories: { expense: [], income: [] },
+      admin: { name: '', contact: '', email: '', headerNote: '', footerNote: '' },
+      loans: []
+    };
+
+    let sqliteConnection = null;
+    let sqliteDb = null;
+    let sqliteInitPromise = null;
+
+    const cloneLocalState = (state) => JSON.parse(JSON.stringify(state || DEFAULT_LOCAL_STATE));
+
+    const normalizeLocalState = (input) => {
+      const state = cloneLocalState(DEFAULT_LOCAL_STATE);
+      const source = input && typeof input === 'object' ? input : {};
+      state.transactions = Array.isArray(source.transactions) ? source.transactions.map((t, idx) => ({
+        id: String(t.id || t.entryId || ('row_' + (idx + 1))),
+        entryId: String(t.entryId || t.id || ('row_' + (idx + 1))),
+        type: String(t.type || t.Flow || '').toUpperCase() === 'GIVEN' ? 'LENT' :
+          String(t.type || t.Flow || '').toUpperCase() === 'RECEIVED' ? 'BORROW' :
+          String(t.type || t.Flow || '').toUpperCase(),
+        date: String(t.date || ''),
+        amount: Number(t.amount) || 0,
+        person: String(t.person || ''),
+        category: String(t.category || ''),
+        note: String(t.note || t.Description || ''),
+        ref: String(t.ref || t['Reference A/c'] || ''),
+        promiseDate: String(t.promiseDate || t['Promise Date'] || '')
+      })) : [];
+      state.persons = Array.isArray(source.persons) ? source.persons.map((p, idx) => ({
+        id: String(p.id || p.personId || ('PID_LOCAL_' + (idx + 1))),
+        personId: String(p.personId || p.id || ('PID_LOCAL_' + (idx + 1))),
+        name: String(p.name || p.Person || ''),
+        phone: String(p.phone || p['Mobile No.'] || ''),
+        address: String(p.address || p.ADDRESS || ''),
+        email: String(p.email || p['Email Id'] || '')
+      })).filter(p => p.name) : [];
+      state.categories = {
+        expense: Array.isArray(source.categories?.expense) ? source.categories.expense.map(String).filter(Boolean) : [],
+        income: Array.isArray(source.categories?.income) ? source.categories.income.map(String).filter(Boolean) : []
+      };
+      state.admin = {
+        ...DEFAULT_LOCAL_STATE.admin,
+        ...(source.admin && typeof source.admin === 'object' ? source.admin : {})
+      };
+      state.loans = Array.isArray(source.loans) ? source.loans.map((l, idx) => ({
+        id: String(l.id || ('LN_LOCAL_' + (idx + 1))),
+        person: String(l.person || ''),
+        loanName: String(l.loanName || ''),
+        principalAmount: Number(l.principalAmount) || 0,
+        loanAmount: Number(l.loanAmount) || 0,
+        monthlyEmi: Number(l.monthlyEmi) || 0,
+        tenureMonths: Number(l.tenureMonths) || 0,
+        firstEmiDate: String(l.firstEmiDate || ''),
+        status: String(l.status || 'ACTIVE').toUpperCase(),
+        schedule: Array.isArray(l.schedule) ? l.schedule.map(s => ({
+          emiNo: Number(s.emiNo) || 0,
+          date: String(s.date || ''),
+          emiAmount: Number(s.emiAmount) || 0,
+          outstandingBal: Number(s.outstandingBal) || 0,
+          paid: s.paid === true || String(s.paid).toLowerCase() === 'true',
+          whoPaid: String(s.whoPaid || ''),
+          paymentId: String(s.paymentId || ''),
+          paidDate: String(s.paidDate || '')
+        })) : []
+      })) : [];
+      return state;
+    };
+
+    const getLocalSqlite = async () => {
+      if (Capacitor.getPlatform() === 'web') return null;
+      if (sqliteDb) return sqliteDb;
+      if (!sqliteInitPromise) {
+        sqliteInitPromise = (async () => {
+          try {
+            sqliteConnection = new SQLiteConnection(CapacitorSQLite);
+            sqliteDb = await sqliteConnection.createConnection(
+              LOCAL_DB_NAME,
+              false,
+              'no-encryption',
+              LOCAL_DB_VERSION,
+              false
+            );
+            await sqliteDb.open();
+            await sqliteDb.execute(
+              'CREATE TABLE IF NOT EXISTS app_state (id INTEGER PRIMARY KEY NOT NULL, data TEXT NOT NULL)'
+            );
+            return sqliteDb;
+          } catch (err) {
+            sqliteDb = null;
+            sqliteConnection = null;
+            throw err;
+          }
+        })();
+      }
       try {
-        if (BackendBridge[fnName]) {
-           return await BackendBridge[fnName](...args);
-        } else {
-           console.warn(`Function ${fnName} not implemented in SQLite bridge yet.`);
-           return null;
-        }
+        return await sqliteInitPromise;
       } catch (err) {
-        throw err;
+        sqliteInitPromise = null;
+        return null;
+      }
+    };
+
+    const readLocalState = async () => {
+      const db = await getLocalSqlite();
+      if (db) {
+        try {
+          const result = await db.query('SELECT data FROM app_state WHERE id = 1 LIMIT 1');
+          if (result?.values?.[0]?.data) return normalizeLocalState(JSON.parse(result.values[0].data));
+        } catch (err) {
+          console.warn('SQLite read failed; falling back to localStorage.', err);
+        }
+      }
+      try {
+        const raw = localStorage.getItem(LOCAL_STATE_KEY);
+        return raw ? normalizeLocalState(JSON.parse(raw)) : cloneLocalState(DEFAULT_LOCAL_STATE);
+      } catch (err) {
+        return cloneLocalState(DEFAULT_LOCAL_STATE);
+      }
+    };
+
+    const writeLocalState = async (nextState) => {
+      const state = normalizeLocalState(nextState);
+      const serialized = JSON.stringify(state);
+      const db = await getLocalSqlite();
+      if (db) {
+        try {
+          await db.run(
+            'INSERT INTO app_state (id, data) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data',
+            [serialized]
+          );
+          return state;
+        } catch (err) {
+          console.warn('SQLite write failed; falling back to localStorage.', err);
+        }
+      }
+      localStorage.setItem(LOCAL_STATE_KEY, serialized);
+      return state;
+    };
+
+    const localPayload = async (stateOverride) => normalizeLocalState(stateOverride || await readLocalState());
+
+    const localApply = async (mutator) => {
+      const current = await readLocalState();
+      const next = await mutator(cloneLocalState(current));
+      return writeLocalState(next);
+    };
+
+    const localCsvEscape = (value) => {
+      const v = value === null || value === undefined ? '' : String(value);
+      return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v;
+    };
+
+    const localRowsToCsv = (headers, rows) =>
+      [headers.map(localCsvEscape).join(','), ...rows.map(row => row.map(localCsvEscape).join(','))].join('\n');
+
+    const localParseCsvRecords = (csvText) => {
+      const rows = [];
+      let row = [];
+      let cell = '';
+      let quoted = false;
+      const text = String(csvText || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+      for (let i = 0; i < text.length; i += 1) {
+        const c = text[i];
+        if (quoted) {
+          if (c === '"' && text[i + 1] === '"') {
+            cell += '"';
+            i += 1;
+          } else if (c === '"') {
+            quoted = false;
+          } else {
+            cell += c;
+          }
+        } else if (c === '"') {
+          quoted = true;
+        } else if (c === ',') {
+          row.push(cell);
+          cell = '';
+        } else if (c === '\n') {
+          row.push(cell);
+          rows.push(row);
+          row = [];
+          cell = '';
+        } else {
+          cell += c;
+        }
+      }
+      if (cell.length || row.length) {
+        row.push(cell);
+        rows.push(row);
+      }
+      return rows;
+    };
+
+    const localExportTransactions = (state) => {
+      const rows = state.transactions.map(t => [
+        t.entryId || t.id || '',
+        '',
+        t.type === 'LENT' ? 'Given' : t.type === 'BORROW' ? 'Received' : t.type === 'EXPENSE' ? 'EXPENSE' : 'INCOME',
+        t.date || '',
+        t.amount || 0,
+        t.person || '',
+        t.category || '',
+        t.note || '',
+        t.ref || '',
+        t.promiseDate || '',
+        ''
+      ]);
+      return localRowsToCsv(LOCAL_HEADERS.transactions, rows);
+    };
+
+    const localExportFlowSummary = (state, type) => {
+      const rows = state.transactions.filter(t => t.type === type);
+      const total = rows.reduce((sum, t) => sum + (Number(t.amount) || 0), 0);
+      const map = {};
+      rows.forEach(t => {
+        const key = t.category || '(Uncategorized)';
+        if (!map[key]) map[key] = { amount: 0, count: 0 };
+        map[key].amount += Number(t.amount) || 0;
+        map[key].count += 1;
+      });
+      const out = Object.keys(map).sort((a, b) => map[b].amount - map[a].amount).map(k => [
+        k, map[k].amount, map[k].count, (total ? (map[k].amount / total) * 100 : 0).toFixed(1) + '%'
+      ]);
+      out.push(['TOTAL', total, rows.length, '100.0%']);
+      return localRowsToCsv(['Category', 'Total Amount', 'Transaction Count', '% of Total'], out);
+    };
+
+    const localExportPersonsSummary = (state) => {
+      const rows = state.persons.map(p => {
+        let dr = 0, cr = 0;
+        state.transactions.filter(t => t.person === p.name).forEach(t => {
+          if (t.type === 'LENT') dr += Number(t.amount) || 0;
+          if (t.type === 'BORROW') cr += Number(t.amount) || 0;
+        });
+        const bal = dr - cr;
+        return [p.name, p.phone, p.address, dr, cr, Math.abs(bal), bal > 0 ? 'RECEIVABLE' : bal < 0 ? 'PAYABLE' : 'SETTLED'];
+      }).sort((a, b) => Number(b[5]) - Number(a[5]));
+      return localRowsToCsv(['Person', 'Phone', 'Address', 'Total Given (Dr)', 'Total Received (Cr)', 'Balance', 'Status'], rows);
+    };
+
+    const localExportAllExpenses = (state, type) => localRowsToCsv(
+      ['Date', 'Category', 'Person', 'Description', 'Reference A/c', 'Amount'],
+      state.transactions.filter(t => t.type === type).map(t => [t.date, t.category, t.person, t.note, t.ref, t.amount])
+    );
+
+    const localExportReceivables = (state, payable) => {
+      const rows = state.persons.map(p => {
+        let dr = 0, cr = 0;
+        state.transactions.filter(t => t.person === p.name).forEach(t => {
+          if (t.type === 'LENT') dr += Number(t.amount) || 0;
+          if (t.type === 'BORROW') cr += Number(t.amount) || 0;
+        });
+        return { p, bal: dr - cr };
+      }).filter(x => payable ? x.bal < 0 : x.bal > 0).map(x => [
+        x.p.name, x.p.phone, x.p.address, payable ? Math.abs(x.bal) : x.bal
+      ]);
+      return localRowsToCsv(
+        ['Person', 'Phone', 'Address', payable ? 'Payable Balance' : 'Receivable Balance'],
+        rows
+      );
+    };
+
+    const localExportLoans = (state) => {
+      const headers = ['Loan ID', 'Loan Name', 'Borrower', 'Loan Taken', 'Loan to Pay', 'Monthly EMI', 'Tenure Months', 'First EMI Date', 'EMI Paid', 'Total EMIs', 'Status'];
+      const rows = [];
+      state.loans.forEach(l => {
+        const schedule = l.schedule || [];
+        const paidCount = schedule.filter(s => s.paid).length;
+        const totalCount = schedule.length;
+        const closed = l.status === 'CLOSED' || (totalCount > 0 && paidCount === totalCount);
+        if (!closed) rows.push([
+          l.id, l.loanName, l.person, l.principalAmount, l.loanAmount, l.monthlyEmi,
+          l.tenureMonths, l.firstEmiDate, paidCount, totalCount, 'ACTIVE'
+        ]);
+      });
+      return localRowsToCsv(headers, rows);
+    };
+
+    const localExportEmi = (state) => localRowsToCsv(
+      LOCAL_HEADERS.emi,
+      state.loans.flatMap(l => (l.schedule || []).map(s => [
+        l.id, s.emiNo, s.date, s.emiAmount, s.outstandingBal, s.paid, s.whoPaid, s.paymentId, s.paidDate
+      ]))
+    );
+
+    const localExportFullBackup = (state) => {
+      const lines = ['### PRO_BUDGET_BHARAT_BACKUP_V1 ###'];
+      const txRows = state.transactions.map(t => [
+        t.entryId || t.id || '', '', t.type === 'LENT' ? 'Given' : t.type === 'BORROW' ? 'Received' : t.type === 'EXPENSE' ? 'EXPENSE' : 'INCOME',
+        t.date || '', t.amount || 0, t.person || '', t.category || '', t.note || '', t.ref || '', t.promiseDate || '', ''
+      ]);
+      const personRows = state.persons.map(p => [p.personId || p.id, p.name, p.phone, p.address, p.email]);
+      const catCount = Math.max(state.categories.expense.length, state.categories.income.length);
+      const catRows = Array.from({ length: catCount }, (_, i) => [state.categories.expense[i] || '', state.categories.income[i] || '']);
+      const adminRows = [[state.admin.name || '', state.admin.contact || '', state.admin.email || '', state.admin.headerNote || '', state.admin.footerNote || '']];
+      const loanRows = state.loans.map(l => [l.id, l.person, l.loanName, l.principalAmount, l.loanAmount, l.monthlyEmi, l.tenureMonths, l.firstEmiDate, l.status]);
+      const emiRows = state.loans.flatMap(l => (l.schedule || []).map(s => [l.id, s.emiNo, s.date, s.emiAmount, s.outstandingBal, s.paid, s.whoPaid, s.paymentId, s.paidDate]));
+      [
+        ['TRANS_RECORD', LOCAL_HEADERS.transactions, txRows],
+        ['Person_Config', LOCAL_HEADERS.persons, personRows],
+        ['Category', LOCAL_HEADERS.categories, catRows],
+        ['Admin_config', LOCAL_HEADERS.admin, adminRows],
+        ['LOANS_MASTER', LOCAL_HEADERS.loans, loanRows],
+        ['Loan_EMI_Records', LOCAL_HEADERS.emi, emiRows]
+      ].forEach(([name, headers, rows]) => {
+        lines.push('### SHEET: ' + name + ' ###');
+        lines.push(headers.map(localCsvEscape).join(','));
+        rows.forEach(r => lines.push(r.map(localCsvEscape).join(',')));
+      });
+      lines.push('### END_BACKUP ###');
+      return lines.join('\n');
+    };
+
+    const localImportFullBackup = async (csvText) => {
+      const rows = localParseCsvRecords(csvText);
+      if (!rows.length || !String(rows[0][0] || '').includes('PRO_BUDGET_BHARAT_BACKUP')) {
+        throw new Error('The selected file is not a valid Pro Budget Bharat multi-sheet backup CSV.');
+      }
+
+      const sheets = {};
+      let current = null;
+      rows.forEach(row => {
+        const first = String(row[0] || '').trim();
+        const match = first.match(/^### SHEET:\s*([^#]+?)\s*###$/);
+        if (match) {
+          current = match[1].trim();
+          if (sheets[current]) throw new Error('Duplicate backup sheet: ' + current);
+          sheets[current] = [];
+          return;
+        }
+        if (first === '### END_BACKUP ###') {
+          current = null;
+          return;
+        }
+        if (current) sheets[current].push(row);
+      });
+
+      const requiredSheets = ['TRANS_RECORD', 'Person_Config', 'Category', 'Admin_config', 'LOANS_MASTER', 'Loan_EMI_Records'];
+      const missingSheets = requiredSheets.filter(name => !Array.isArray(sheets[name]));
+      if (missingSheets.length) throw new Error('Backup is incomplete. Missing: ' + missingSheets.join(', '));
+
+      const headerEquals = (actual, expected) => actual.length === expected.length && expected.every((h, i) => String(actual[i] || '').trim() === h);
+      const nonEmptyRows = data => data.filter(r => r.some(v => String(v ?? '').trim() !== ''));
+      const readSheet = (name, expectedHeaders) => {
+        const data = sheets[name] || [];
+        if (!headerEquals(data[0] || [], expectedHeaders)) throw new Error('Invalid schema in backup sheet: ' + name);
+        return nonEmptyRows(data.slice(1));
+      };
+
+      const txRows = readSheet('TRANS_RECORD', LOCAL_HEADERS.transactions);
+      const pRows = readSheet('Person_Config', LOCAL_HEADERS.persons);
+      const cRows = readSheet('Category', LOCAL_HEADERS.categories);
+      const aRows = readSheet('Admin_config', LOCAL_HEADERS.admin);
+      const lRows = readSheet('LOANS_MASTER', LOCAL_HEADERS.loans);
+      const eRows = readSheet('Loan_EMI_Records', LOCAL_HEADERS.emi);
+      const next = cloneLocalState(DEFAULT_LOCAL_STATE);
+
+      const txIdx = Object.fromEntries(LOCAL_HEADERS.transactions.map((h, i) => [h, i]));
+      const transactionIds = new Set();
+      next.transactions = txRows.map((r, idx) => {
+        const id = String(r[txIdx['ENTRY_ID']] || ('row_' + (idx + 1))).trim();
+        if (!id) throw new Error('A transaction row has no ENTRY_ID.');
+        if (transactionIds.has(id)) throw new Error('Duplicate transaction ENTRY_ID: ' + id);
+        transactionIds.add(id);
+        const rawType = String(r[txIdx['Transaction Type']] || '').trim().toUpperCase();
+        const type = rawType === 'GIVEN' ? 'LENT' : rawType === 'RECEIVED' ? 'BORROW' : rawType;
+        if (!['EXPENSE', 'INCOME', 'LENT', 'BORROW'].includes(type)) throw new Error('Invalid transaction type in backup: ' + rawType);
+        return { id, entryId: id, type, date: String(r[txIdx['Date']] || ''), amount: Number(r[txIdx['Amount']]) || 0, person: String(r[txIdx['Person']] || ''), category: String(r[txIdx['Category']] || ''), note: String(r[txIdx['Description']] || ''), ref: String(r[txIdx['Reference A/c']] || ''), promiseDate: String(r[txIdx['Promise Date']] || '') };
+      });
+
+      const pIdx = Object.fromEntries(LOCAL_HEADERS.persons.map((h, i) => [h, i]));
+      const personIds = new Set();
+      const personNames = new Set();
+      next.persons = pRows.map((r, idx) => {
+        const id = String(r[pIdx['Person ID']] || ('PID_LOCAL_' + (idx + 1))).trim();
+        const name = String(r[pIdx['Person']] || '').trim();
+        if (!name) throw new Error('A person row has no name.');
+        if (personIds.has(id)) throw new Error('Duplicate Person ID: ' + id);
+        if (personNames.has(name.toLowerCase())) throw new Error('Duplicate person name: ' + name);
+        personIds.add(id); personNames.add(name.toLowerCase());
+        return { id, personId: id, name, phone: String(r[pIdx['Mobile No.']] || ''), address: String(r[pIdx['ADDRESS']] || ''), email: String(r[pIdx['Email Id']] || '') };
+      });
+
+      const cIdx = Object.fromEntries(LOCAL_HEADERS.categories.map((h, i) => [h, i]));
+      next.categories.expense = [...new Set(cRows.map(r => String(r[cIdx['Expense Type']] || '').trim()).filter(Boolean))];
+      next.categories.income = [...new Set(cRows.map(r => String(r[cIdx['Income type']] || '').trim()).filter(Boolean))];
+
+      const aIdx = Object.fromEntries(LOCAL_HEADERS.admin.map((h, i) => [h, i]));
+      if (aRows[0]) next.admin = { name: String(aRows[0][aIdx['NAME']] || ''), contact: String(aRows[0][aIdx['CONTACT']] || ''), email: String(aRows[0][aIdx['Email id']] || ''), headerNote: String(aRows[0][aIdx['Statement Header note']] || ''), footerNote: String(aRows[0][aIdx['Statement Footer note']] || '') };
+
+      const lIdx = Object.fromEntries(LOCAL_HEADERS.loans.map((h, i) => [h, i]));
+      const loanIds = new Set();
+      next.loans = lRows.map((r, idx) => {
+        const id = String(r[lIdx['Loan ID']] || ('LN_LOCAL_' + (idx + 1))).trim();
+        if (!id) throw new Error('A loan row has no Loan ID.');
+        if (loanIds.has(id)) throw new Error('Duplicate Loan ID: ' + id);
+        loanIds.add(id);
+        return { id, person: String(r[lIdx['Person']] || ''), loanName: String(r[lIdx['Loan Name']] || ''), principalAmount: Number(r[lIdx['Loan Taken']]) || 0, loanAmount: Number(r[lIdx['Loan to Pay']]) || 0, monthlyEmi: Number(r[lIdx['Monthly EMI']]) || 0, tenureMonths: Number(r[lIdx['Tenure Months']]) || 0, firstEmiDate: String(r[lIdx['First EMI Date']] || ''), status: String(r[lIdx['Status']] || 'ACTIVE').toUpperCase(), schedule: [] };
+      });
+
+      const eIdx = Object.fromEntries(LOCAL_HEADERS.emi.map((h, i) => [h, i]));
+      const schedules = {};
+      const emiKeys = new Set();
+      eRows.forEach(r => {
+        const id = String(r[eIdx['Loan ID']] || '').trim();
+        if (!id) throw new Error('An EMI row has no Loan ID.');
+        if (!loanIds.has(id)) throw new Error('EMI record references unknown Loan ID: ' + id);
+        const emiNo = Number(r[eIdx['EMI No']]) || 0;
+        if (emiNo < 1) throw new Error('Invalid EMI number for Loan ID: ' + id);
+        const key = id + '#' + emiNo;
+        if (emiKeys.has(key)) throw new Error('Duplicate EMI record: ' + key);
+        emiKeys.add(key);
+        if (!schedules[id]) schedules[id] = [];
+        schedules[id].push({ emiNo, date: String(r[eIdx['Date']] || ''), emiAmount: Number(r[eIdx['EMI Amount']]) || 0, outstandingBal: Number(r[eIdx['Outstanding Bal']]) || 0, paid: String(r[eIdx['Paid']] || '').trim().toLowerCase() === 'true', whoPaid: String(r[eIdx['Who Paid']] || ''), paymentId: String(r[eIdx['Txn. Id']] || ''), paidDate: String(r[eIdx['Paid Date']] || '') });
+      });
+      next.loans.forEach(l => { l.schedule = (schedules[l.id] || []).sort((a, b) => a.emiNo - b.emiNo); });
+
+      // All validation is completed before this single write, so a bad backup never partially replaces user data.
+      return writeLocalState(next);
+    };
+
+    const buildLocalSchedule = (loan) => {
+      const tenure = Math.max(0, Number(loan.tenureMonths) || 0);
+      const emi = Number(loan.monthlyEmi) || 0;
+      const total = Number(loan.loanAmount) || 0;
+      const start = parseDate(loan.firstEmiDate);
+      return Array.from({ length: tenure }, (_, i) => {
+        const date = new Date(start);
+        if (!isNaN(date.getTime())) date.setMonth(date.getMonth() + i);
+        const remaining = Math.max(0, total - emi * (i + 1));
+        return {
+          emiNo: i + 1,
+          date: isNaN(date.getTime()) ? String(loan.firstEmiDate || '') : formatDateForStorage(date),
+          emiAmount: emi,
+          outstandingBal: remaining,
+          paid: false,
+          whoPaid: '',
+          paymentId: '',
+          paidDate: ''
+        };
+      });
+    };
+
+    const localGasRun = async (fnName, ...args) => {
+      if (window.google?.script?.run) {
+        return new Promise((resolve, reject) => {
+          window.google.script.run
+            .withSuccessHandler(resolve)
+            .withFailureHandler(reject)
+            [fnName](...args);
+        });
+      }
+
+      const state = await readLocalState();
+
+      switch (fnName) {
+        case 'getDashboardPayload':
+          return localPayload(state);
+
+        case 'addTransaction': {
+          const tx = args[0] || {};
+          return localApply(s => {
+            const id = crypto?.randomUUID ? crypto.randomUUID() : 'TX_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+            s.transactions.push({
+              id, entryId: id, type: String(tx.type || '').toUpperCase(),
+              amount: Number(tx.amount) || 0, category: String(tx.category || ''),
+              person: String(tx.person || ''), date: String(tx.date || ''),
+              promiseDate: String(tx.promiseDate || ''), note: String(tx.note || ''),
+              ref: String(tx.ref || '')
+            });
+            return s;
+          });
+        }
+
+        case 'updateTransaction': {
+          const tx = args[0] || {};
+          return localApply(s => {
+            const id = String(tx.entryId || tx.id || '');
+            const target = s.transactions.find(t => String(t.entryId || t.id) === id);
+            if (!target) throw new Error('Transaction not found: ' + id);
+            Object.assign(target, {
+              type: String(tx.type || target.type).toUpperCase(),
+              amount: Number(tx.amount) || 0,
+              category: String(tx.category || ''),
+              person: String(tx.person || ''),
+              date: String(tx.date || ''),
+              promiseDate: String(tx.promiseDate || ''),
+              note: String(tx.note || ''),
+              ref: String(tx.ref || '')
+            });
+            return s;
+          });
+        }
+
+        case 'deleteTransaction': {
+          const id = typeof args[0] === 'object' ? String(args[0]?.entryId || args[0]?.id || '') : String(args[0] || '');
+          return localApply(s => {
+            const before = s.transactions.length;
+            s.transactions = s.transactions.filter(t => String(t.id || t.entryId) !== id);
+            if (before === s.transactions.length) throw new Error('Transaction with ID "' + id + '" was not found.');
+            return s;
+          });
+        }
+
+        case 'addPerson': {
+          const p = args[0] || {};
+          return localApply(s => {
+            const name = String(p.name || '').trim();
+            if (!name) throw new Error('Person name is required.');
+            const prefix = name.replace(/[^a-zA-Z0-9]/g, '').slice(0, 4).toUpperCase() || 'USER';
+            const id = 'PID_' + prefix + '_' + Math.floor(1000 + Math.random() * 9000);
+            s.persons.push({ id, personId: id, name, phone: String(p.phone || ''), address: String(p.address || 'Maharashtra'), email: String(p.email || '') });
+            return s;
+          });
+        }
+
+        case 'updatePerson': {
+          const p = args[0] || {};
+          return localApply(s => {
+            const oldName = String(p.oldName || p.name || '').trim().toLowerCase();
+            const targetId = String(p.id || p.personId || '').trim();
+            const target = s.persons.find(x => (targetId && String(x.id) === targetId) || (!targetId && x.name.trim().toLowerCase() === oldName));
+            if (!target) throw new Error('Person not found.');
+            const previousName = target.name;
+            target.name = String(p.name || '').trim();
+            target.phone = String(p.phone || '');
+            target.address = String(p.address || '');
+            target.email = String(p.email || '');
+            if (previousName.trim().toLowerCase() !== target.name.trim().toLowerCase()) {
+              s.transactions.forEach(t => { if (String(t.person).trim().toLowerCase() === previousName.trim().toLowerCase()) t.person = target.name; });
+              s.loans.forEach(l => { if (String(l.person).trim().toLowerCase() === previousName.trim().toLowerCase()) l.person = target.name; });
+            }
+            return s;
+          });
+        }
+
+        case 'deletePerson': {
+          const nameOrId = String(args[0] || '').trim().toLowerCase();
+          return localApply(s => {
+            const matched = s.persons.find(p => p.name.trim().toLowerCase() === nameOrId || String(p.id).trim().toLowerCase() === nameOrId);
+            if (!matched) return s;
+            s.persons = s.persons.filter(p => p !== matched);
+            s.transactions = s.transactions.filter(t => t.person.trim().toLowerCase() !== matched.name.trim().toLowerCase());
+            return s;
+          });
+        }
+
+        case 'addCategory': {
+          const type = String(args[0] || '').toLowerCase() === 'income' ? 'income' : 'expense';
+          const name = String(args[1] || '').trim();
+          return localApply(s => {
+            if (name && !s.categories[type].includes(name)) s.categories[type].push(name);
+            return s;
+          });
+        }
+
+        case 'updateCategory': {
+          const oldData = args[0] || {};
+          const newData = args[1] || {};
+          return localApply(s => {
+            const type = String(oldData.type || 'expense').toLowerCase() === 'income' ? 'income' : 'expense';
+            const idx = s.categories[type].indexOf(String(oldData.oldName || ''));
+            if (idx >= 0) s.categories[type][idx] = String(newData.newName || '');
+            return s;
+          });
+        }
+
+        case 'deleteCategory': {
+          const cat = args[0] || {};
+          return localApply(s => {
+            const type = String(cat.type || 'expense').toLowerCase() === 'income' ? 'income' : 'expense';
+            s.categories[type] = s.categories[type].filter(x => x !== String(cat.name || ''));
+            return s;
+          });
+        }
+
+        case 'updateAdminConfig': {
+          const data = args[0] || {};
+          return localApply(s => {
+            s.admin = {
+              name: String(data.name || ''),
+              contact: String(data.contact || ''),
+              email: String(data.email || ''),
+              headerNote: String(data.headerNote || data.note || ''),
+              footerNote: String(data.footerNote || '')
+            };
+            return s;
+          });
+        }
+
+        case 'saveLoan': {
+          const loan = args[0] || {};
+          return localApply(s => {
+            const id = String(loan.id || ('LN_' + Date.now()));
+            const nextLoan = {
+              id,
+              person: String(loan.person || ''),
+              loanName: String(loan.loanName || ''),
+              principalAmount: Number(loan.principalAmount) || 0,
+              loanAmount: Number(loan.loanAmount) || 0,
+              monthlyEmi: Number(loan.monthlyEmi) || 0,
+              tenureMonths: Number(loan.tenureMonths) || 0,
+              firstEmiDate: String(loan.firstEmiDate || ''),
+              status: String(loan.status || 'ACTIVE').toUpperCase(),
+              schedule: Array.isArray(loan.schedule) && loan.schedule.length ? loan.schedule : buildLocalSchedule(loan)
+            };
+            const idx = s.loans.findIndex(x => x.id === id);
+            if (idx >= 0) s.loans[idx] = nextLoan; else s.loans.push(nextLoan);
+            return s;
+          });
+        }
+
+        case 'deleteLoan': {
+          const id = String(args[0] || '').trim();
+          return localApply(s => {
+            s.loans = s.loans.filter(l => l.id !== id);
+            return s;
+          });
+        }
+
+        case 'exportTransactionsCsv':
+          return localExportTransactions(state);
+        case 'exportIncomeSummaryCsv':
+          return localExportFlowSummary(state, 'INCOME');
+        case 'exportExpenseSummaryCsv':
+          return localExportFlowSummary(state, 'EXPENSE');
+        case 'exportPersonsSummaryCsv':
+          return localExportPersonsSummary(state);
+        case 'exportAllExpensesCsv':
+          return localExportAllExpenses(state, 'EXPENSE');
+        case 'exportAllIncomesCsv':
+          return localExportAllExpenses(state, 'INCOME');
+        case 'exportReceivablesCsv':
+          return localExportReceivables(state, false);
+        case 'exportPayablesCsv':
+          return localExportReceivables(state, true);
+        case 'exportActiveLoansSummaryCsv':
+          return localExportLoans(state);
+        case 'exportAllLoanEmiRecordsCsv':
+          return localExportEmi(state);
+        case 'exportAllSheetsBackupCsv':
+          return localExportFullBackup(state);
+        case 'importAllSheetsBackupCsv':
+          return localImportFullBackup(args[0]);
+        default:
+          throw new Error('Unsupported local operation: ' + fnName);
+      }
+    };
+
+    const gasRun = (fnName, ...args) => localGasRun(fnName, ...args);
+
+    const pickContactForPerson = async (currentFormData, setFormData) => {
+      const mergeContact = (contact) => {
+        if (!contact) return false;
+        const nameValue = Array.isArray(contact.name) ? contact.name[0] : contact.name;
+        const telValue = Array.isArray(contact.tel) ? contact.tel[0] : contact.tel;
+        const emailValue = Array.isArray(contact.email) ? contact.email[0] : contact.email;
+        const addressValue = Array.isArray(contact.address) ? contact.address[0] : contact.address;
+        setFormData(prev => ({
+          ...prev,
+          name: String(nameValue || prev.name || '').trim(),
+          phone: String(telValue || prev.phone || '').trim(),
+          email: String(emailValue || prev.email || '').trim(),
+          address: typeof addressValue === 'string' ? addressValue : (prev.address || '')
+        }));
+        return true;
+      };
+
+      try {
+        const capPlugins = window.Capacitor?.Plugins || {};
+        const contactsPlugin = capPlugins.Contacts || capPlugins.Contact;
+        if (contactsPlugin) {
+          if (typeof contactsPlugin.requestPermissions === 'function') {
+            const permission = await contactsPlugin.requestPermissions();
+            const denied = permission?.contacts === 'denied' || permission?.readContacts === 'denied' || permission?.displayNames === 'denied';
+            if (denied) throw new Error('Contacts permission was denied. Please allow Contacts access in Android Settings.');
+          }
+          const picker = contactsPlugin.pickContact || contactsPlugin.selectContact || contactsPlugin.chooseContact;
+          if (typeof picker === 'function') {
+            const result = await picker.call(contactsPlugin);
+            const contact = result?.contact || result?.contacts?.[0] || result;
+            if (mergeContact(contact)) return true;
+          }
+        }
+
+        if (navigator.contacts?.select) {
+          const result = await navigator.contacts.select(['name', 'tel', 'email', 'address'], { multiple: false });
+          if (result?.[0] && mergeContact(result[0])) return true;
+        }
+
+        throw new Error('Android Contacts integration is not installed. Add/register a Capacitor Contacts plugin that exposes requestPermissions() and pickContact(), then rebuild the APK.');
+      } catch (err) {
+        if (err?.name === 'AbortError') return false;
+        alert(err?.message || 'Unable to open contacts.');
+        return false;
       }
     };
 
@@ -265,7 +931,7 @@ const AppBottomBranding = () => {
         throw new Error("Target render reference not found");
       }
 
-      if (target instanceof HTMLElement === false && target.nodeType !== 1) {
+      if (typeof HTMLElement !== 'undefined' && target instanceof HTMLElement === false && target.nodeType !== 1) {
         target = target.current || target;
       }
 
@@ -345,6 +1011,36 @@ const AppBottomBranding = () => {
     });
 
     const AppContext = createContext();
+
+    class AppErrorBoundary extends React.Component {
+      constructor(props) {
+        super(props);
+        this.state = { hasError: false, message: '' };
+      }
+      static getDerivedStateFromError(error) {
+        return { hasError: true, message: String(error && error.message ? error.message : error || 'Unexpected application error') };
+      }
+      componentDidCatch(error, info) {
+        console.error('Budget Bharat render error:', error, info);
+      }
+      handleRetry = () => this.setState({ hasError: false, message: '' });
+      render() {
+        if (!this.state.hasError) return this.props.children;
+        return (
+          <div className="app-shell">
+            <div className="flex-1 flex flex-col items-center justify-center text-center space-y-3 p-6">
+              <i className="fa-solid fa-triangle-exclamation text-3xl text-[#D6455D]"></i>
+              <p className="text-sm font-bold text-[#1E104B]">Budget Bharat recovered from an unexpected error</p>
+              <p className="text-xs text-[#625E70] max-w-sm break-words">{this.state.message}</p>
+              <div className="flex gap-2">
+                <button type="button" onClick={this.handleRetry} className="px-4 py-2 bg-[#1E104B] text-white rounded-xl text-xs font-bold shadow-md">Try Again</button>
+                <button type="button" onClick={() => window.location.reload()} className="px-4 py-2 bg-[#078A87] text-white rounded-xl text-xs font-bold shadow-md">Reload App</button>
+              </div>
+            </div>
+          </div>
+        );
+      }
+    }
 
     const AppProvider = ({ children }) => {
       const [transactions, setTransactions] = useState([]);
@@ -508,6 +1204,7 @@ const AppBottomBranding = () => {
           .catch((err) => { showFeedback('Save failed: ' + err.message); throw err; });
       };
 
+      // Only path that forces a fresh Sheet read, bypassing the server cache.
       const syncData = () => { refresh(true, true); };
 
       const exportCsv = (rpcFn, filename) => {
@@ -517,125 +1214,17 @@ const AppBottomBranding = () => {
           .catch((err) => showFeedback('Export failed: ' + err.message));
       };
 
-      // ---- Full data backup (single CSV, all tables) ----
-      const csvEscape = (v) => {
-        const s = (v === null || v === undefined) ? '' : String(v);
-        return (s.includes(',') || s.includes('"') || s.includes('\n')) ? '"' + s.replace(/"/g, '""') + '"' : s;
-      };
-      const csvSection = (headers, rows) => [headers.join(',')]
-        .concat(rows.map(r => headers.map(h => csvEscape(r[h])).join(',')))
-        .join('\n');
-
-      const exportFullBackupCsv = () => {
-        showFeedback('Preparing full backup...');
-        try {
-          const lines = [];
-          lines.push('##SECTION:transactions');
-          lines.push(csvSection(['id', 'type', 'amount', 'category', 'person', 'date', 'note', 'ref', 'promiseDate'], transactions));
-          lines.push('##SECTION:persons');
-          lines.push(csvSection(['id', 'name', 'phone', 'email', 'address'], persons));
-          lines.push('##SECTION:categories');
-          const catRows = [
-            ...(categories.expense || []).map(name => ({ type: 'expense', name })),
-            ...(categories.income || []).map(name => ({ type: 'income', name })),
-          ];
-          lines.push(csvSection(['type', 'name'], catRows));
-          lines.push('##SECTION:loans');
-          lines.push(csvSection(
-            ['id', 'person', 'loanName', 'principalAmount', 'loanAmount', 'monthlyEmi', 'tenureMonths', 'firstEmiDate', 'status', 'scheduleJson'],
-            (loans || []).map(l => ({ ...l, scheduleJson: JSON.stringify(l.schedule || []) }))
-          ));
-          lines.push('##SECTION:admin');
-          lines.push(csvSection(['name', 'contact', 'email', 'headerNote', 'footerNote'], [admin || {}]));
-
-          downloadCsv(lines.join('\n'), `budget_bharat_full_backup_${Date.now()}.csv`);
-          showFeedback('Full backup exported');
-        } catch (err) {
-          showFeedback('Backup export failed: ' + err.message);
-        }
-      };
-
-      // Minimal RFC4180-style parser: handles quoted fields with embedded
-      // commas, quotes ("" escape), and newlines.
-      const parseCsvRows = (text) => {
-        const rows = [];
-        let row = [], field = '', inQuotes = false;
-        for (let i = 0; i < text.length; i++) {
-          const c = text[i];
-          if (inQuotes) {
-            if (c === '"') {
-              if (text[i + 1] === '"') { field += '"'; i++; }
-              else inQuotes = false;
-            } else field += c;
-          } else if (c === '"') inQuotes = true;
-          else if (c === ',') { row.push(field); field = ''; }
-          else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
-          else if (c === '\r') { /* skip */ }
-          else field += c;
-        }
-        if (field.length > 0 || row.length > 0) { row.push(field); rows.push(row); }
-        return rows.filter(r => !(r.length === 1 && r[0] === ''));
-      };
-
-      const importFullBackupCsv = (file) => {
-        if (!file) return;
-        showFeedback('Restoring backup...');
-        const reader = new FileReader();
-        reader.onload = (e) => {
-          try {
-            const text = String(e.target.result);
-            const parts = text.split(/(?=##SECTION:)/).map(p => p.trim()).filter(Boolean);
-            const data = { transactions: [], persons: [], categories: { expense: [], income: [] }, loans: [], admin: {} };
-
-            parts.forEach(part => {
-              const firstNL = part.indexOf('\n');
-              const sectionName = part.slice(0, firstNL).replace('##SECTION:', '').trim();
-              const body = part.slice(firstNL + 1);
-              const rows = parseCsvRows(body);
-              if (rows.length === 0) return;
-              const cols = rows[0];
-              const records = rows.slice(1).map(r => {
-                const obj = {};
-                cols.forEach((c, i) => { obj[c] = r[i] !== undefined ? r[i] : ''; });
-                return obj;
-              });
-
-              if (sectionName === 'transactions') {
-                data.transactions = records.map(r => ({ ...r, amount: Number(r.amount) || 0 }));
-              } else if (sectionName === 'persons') {
-                data.persons = records;
-              } else if (sectionName === 'categories') {
-                records.forEach(r => {
-                  if (r.type === 'income') data.categories.income.push(r.name);
-                  else data.categories.expense.push(r.name);
-                });
-              } else if (sectionName === 'loans') {
-                data.loans = records.map(r => {
-                  let schedule = [];
-                  try { schedule = JSON.parse(r.scheduleJson || '[]'); } catch (e) { schedule = []; }
-                  return {
-                    ...r,
-                    principalAmount: Number(r.principalAmount) || 0,
-                    loanAmount: Number(r.loanAmount) || 0,
-                    monthlyEmi: Number(r.monthlyEmi) || 0,
-                    tenureMonths: Number(r.tenureMonths) || 0,
-                    schedule
-                  };
-                });
-              } else if (sectionName === 'admin') {
-                data.admin = records[0] || {};
-              }
-            });
-
-            gasRun('restoreFullBackup', data)
-              .then((payload) => { applyPayload(payload); showFeedback('Backup restored successfully'); })
-              .catch((err) => showFeedback('Restore failed: ' + err.message));
-          } catch (err) {
-            showFeedback('Invalid backup file: ' + err.message);
-          }
-        };
-        reader.onerror = () => showFeedback('Could not read that file');
-        reader.readAsText(file);
+      const importBackupCsv = (csvContent) => {
+        showFeedback('Restoring all sheets from backup...');
+        return gasRun('importAllSheetsBackupCsv', csvContent)
+          .then((payload) => {
+            if (payload) applyPayload(payload);
+            showFeedback('All sheets and data restored successfully!');
+          })
+          .catch((err) => {
+            showFeedback('Restore failed: ' + (err && err.message ? err.message : String(err)));
+            throw err;
+          });
       };
 
       const filteredTransactions = useMemo(() => {
@@ -687,7 +1276,7 @@ const AppBottomBranding = () => {
           directoryFilter, setDirectoryFilter,
           addTransaction, updateTransaction, deleteTransaction, addPerson, updatePerson, deletePerson, addCategory, updateCategory, deleteCategory, updateAdminConfig,
           saveLoanAction, deleteLoanAction,
-          syncData, exportCsv, exportFullBackupCsv, importFullBackupCsv, refresh, showFeedback
+          syncData, exportCsv, importBackupCsv, refresh, showFeedback
         }}>
           {children}
           {toast.show && (
@@ -1098,7 +1687,7 @@ const AppBottomBranding = () => {
     const SideMenuBranding = () => (
       <div className="pt-6 pb-3 flex flex-col items-center justify-center text-center opacity-80 flex-none">
         <img
-          src={Array.isArray(APP_LOGO_COLORED) ? APP_LOGO_COLORED.join('') : APP_LOGO_COLORED}
+          src={APP_LOGO_COLORED}
           alt="Budget Bharat"
           className="h-6 object-contain mb-1.5"
         />
@@ -1107,6 +1696,40 @@ const AppBottomBranding = () => {
     );
 
     const SideMenu = () => {
+      const [restoreModal, setRestoreModal] = useState(null);
+      const { importBackupCsv, applyPayload, refresh } = useContext(AppContext);
+
+      const handleProceedRestore = () => {
+        if (!restoreModal || !restoreModal.file) return;
+        setRestoreModal((prev) => ({ ...prev, status: 'processing' }));
+
+        const reader = new FileReader();
+        reader.onload = (evt) => {
+          const csvText = evt.target.result;
+          const runRestore = importBackupCsv
+            ? importBackupCsv(csvText)
+            : gasRun('importAllSheetsBackupCsv', csvText).then((payload) => {
+                if (payload && typeof applyPayload === 'function') applyPayload(payload);
+                if (typeof refresh === 'function') refresh(true, true);
+              });
+
+          Promise.resolve(runRestore)
+            .then(() => {
+              setRestoreModal((prev) => ({ ...prev, status: 'success' }));
+            })
+            .catch((err) => {
+              setRestoreModal((prev) => ({
+                ...prev,
+                status: 'error',
+                error: err && err.message ? err.message : String(err)
+              }));
+            });
+        };
+        reader.onerror = () => {
+          setRestoreModal((prev) => ({ ...prev, status: 'error', error: 'Failed to read the backup file.' }));
+        };
+        reader.readAsText(restoreModal.file);
+      };
       const {
         isMenuOpen, setIsMenuOpen, menuView, setMenuView,
         persons, categories, admin,
@@ -1211,7 +1834,7 @@ const AppBottomBranding = () => {
             <div className="grad-dark p-5 text-white shadow-sm flex items-center justify-between">
               <div className="flex items-center gap-3">
                 <img
-                  src={Array.isArray(APP_ICON_WHITE) ? APP_ICON_WHITE.join('') : APP_ICON_WHITE}
+                  src={APP_ICON_WHITE}
                   alt="App Icon"
                   className="h-9 w-9 object-contain opacity-95 flex-none"
                 />
@@ -1246,7 +1869,149 @@ const AppBottomBranding = () => {
                 <button onClick={() => openSubView('addCategory')} className="w-full text-left px-6 py-3 hover:bg-white transition-colors text-sm font-bold text-[#1E104B]"><i className="fa-solid fa-tag w-7 text-[#078A87]"></i> Add Category</button>
 
                 <div className="px-6 mt-6 mb-2 text-[10px] font-bold text-[#8A8596] uppercase tracking-widest">Export CSV</div>
+                {/* Hidden File Input for Backup Restore */}
+                <input
+                  type="file"
+                  id="backup_csv_file_input"
+                  accept=".csv,text/csv"
+                  style={{ display: 'none' }}
+                  onChange={(e) => {
+                    const file = e.target.files && e.target.files[0];
+                    if (!file) return;
+                    setRestoreModal({ file, status: 'confirm' });
+                  }}
+                />
+                <button
+                  onClick={() => handleAction(() => {
+                    const now = new Date();
+                    const dateStr = now.getFullYear() + '-' + ('0' + (now.getMonth() + 1)).slice(-2) + '-' + ('0' + now.getDate()).slice(-2);
+                    exportCsv('exportAllSheetsBackupCsv', `Pro_Budget_Bharat_FULL_BACKUP_${dateStr}.csv`);
+                  })}
+                  className="w-full text-left px-6 py-2.5 hover:bg-white transition-colors text-xs font-bold text-[#7B2B8C] bg-purple-50/60"
+                >
+                  <i className="fa-solid fa-cloud-arrow-down w-7 text-[#7B2B8C]"></i> Export Full Backup (All Sheets)
+                </button>
+                <button
+                  onClick={() => {
+                    const inputEl = document.getElementById('backup_csv_file_input');
+                    if (inputEl) inputEl.click();
+                  }}
+                  className="w-full text-left px-6 py-2.5 hover:bg-white transition-colors text-xs font-bold text-[#078A87] bg-teal-50/60"
+                >
+                  <i className="fa-solid fa-cloud-arrow-up w-7 text-[#078A87]"></i> Restore Backup CSV
+                </button>
                 <button onClick={() => handleAction(() => exportCsv('exportActiveLoansSummaryCsv', 'active_loans_summary.csv'))} className="w-full text-left px-6 py-2.5 hover:bg-white transition-colors text-xs font-bold text-[#1E104B]"><i className="fa-solid fa-hand-holding-dollar w-7 text-[#078A87]"></i> Active Loans Summary</button>
+
+                {/* Custom Modal for Backup Restore */}
+                {restoreModal && (
+                  <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs">
+                    <div className="bg-white w-full max-w-sm rounded-3xl p-6 shadow-2xl border border-[#E4E1EA] text-center transform transition-all animate-slide-up">
+                      {/* 1. Confirmation State */}
+                      {restoreModal.status === 'confirm' && (
+                        <div>
+                          <div className="w-14 h-14 mx-auto mb-3 rounded-2xl bg-amber-50 border border-amber-200 flex items-center justify-center text-amber-500 shadow-sm">
+                            <i className="fa-solid fa-triangle-exclamation text-2xl"></i>
+                          </div>
+                          <h3 className="text-base font-black text-[#1E104B] tracking-tight">Restore System Backup?</h3>
+                          <div className="my-3 px-3 py-2 bg-[#F4F3F8] rounded-xl border border-[#E4E1EA] flex items-center justify-center gap-2 text-left">
+                            <i className="fa-solid fa-file-csv text-[#078A87] text-lg"></i>
+                            <span className="text-[11px] font-bold text-[#1E104B] truncate max-w-[210px]" title={restoreModal.file.name}>
+                              {restoreModal.file.name}
+                            </span>
+                          </div>
+                          <p className="text-xs text-[#625E70] leading-relaxed mb-5">
+                            This action will replace all data in <span className="font-bold text-[#1E104B]">all sheets</span> (Transactions, Persons, Categories, Admin, Loans &amp; EMI records) with this backup.
+                          </p>
+                          <div className="flex gap-2.5">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setRestoreModal(null);
+                                const inputEl = document.getElementById('backup_csv_file_input');
+                                if (inputEl) inputEl.value = '';
+                              }}
+                              className="flex-1 py-2.5 rounded-xl border border-[#E4E1EA] text-xs font-bold text-[#625E70] hover:bg-[#F4F3F8] active:scale-95 transition-all"
+                            >
+                              Cancel
+                            </button>
+                            <button
+                              type="button"
+                              onClick={handleProceedRestore}
+                              className="flex-1 py-2.5 rounded-xl bg-gradient-to-r from-[#D6455D] to-[#F45777] text-white text-xs font-black shadow-md shadow-[#F45777]/30 hover:opacity-95 active:scale-95 transition-all flex items-center justify-center gap-1.5"
+                            >
+                              <i className="fa-solid fa-rotate-left text-xs"></i>
+                              <span>Restore Now</span>
+                            </button>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* 2. Processing Spinner State */}
+                      {restoreModal.status === 'processing' && (
+                        <div className="py-4">
+                          <div className="w-14 h-14 mx-auto mb-3.5 rounded-2xl bg-[#078A87]/10 border border-[#078A87]/30 flex items-center justify-center text-[#078A87]">
+                            <i className="fa-solid fa-circle-notch animate-spin text-2xl"></i>
+                          </div>
+                          <h3 className="text-base font-black text-[#1E104B] tracking-tight">Restoring Backup...</h3>
+                          <p className="text-xs text-[#625E70] leading-relaxed mt-2">
+                            Importing data into sheets and refreshing your dashboard. Please do not close this window.
+                          </p>
+                          <div className="w-full bg-[#ECEAF1] h-1.5 rounded-full overflow-hidden mt-4">
+                            <div className="bg-gradient-to-r from-[#7B2B8C] to-[#078A87] h-full rounded-full animate-pulse w-3/4 mx-auto"></div>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* 3. Success State */}
+                      {restoreModal.status === 'success' && (
+                        <div>
+                          <div className="w-14 h-14 mx-auto mb-3.5 rounded-2xl bg-emerald-50 border border-emerald-200 flex items-center justify-center text-emerald-600 shadow-sm">
+                            <i className="fa-solid fa-circle-check text-2xl"></i>
+                          </div>
+                          <h3 className="text-base font-black text-[#1E104B] tracking-tight">Restore Successful!</h3>
+                          <p className="text-xs text-[#625E70] leading-relaxed mt-2 mb-5">
+                            All sheets have been successfully restored and your balances are updated.
+                          </p>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setRestoreModal(null);
+                              const inputEl = document.getElementById('backup_csv_file_input');
+                              if (inputEl) inputEl.value = '';
+                            }}
+                            className="w-full py-2.5 rounded-xl bg-[#078A87] hover:bg-[#067370] text-white text-xs font-black shadow-md shadow-[#078A87]/25 active:scale-95 transition-all"
+                          >
+                            Done
+                          </button>
+                        </div>
+                      )}
+
+                      {/* 4. Error State */}
+                      {restoreModal.status === 'error' && (
+                        <div>
+                          <div className="w-14 h-14 mx-auto mb-3.5 rounded-2xl bg-rose-50 border border-rose-200 flex items-center justify-center text-rose-600">
+                            <i className="fa-solid fa-circle-xmark text-2xl"></i>
+                          </div>
+                          <h3 className="text-base font-black text-[#1E104B] tracking-tight">Restore Failed</h3>
+                          <p className="text-xs text-[#D6455D] leading-relaxed mt-2 mb-5">
+                            {restoreModal.error || 'Failed to restore backup.'}
+                          </p>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setRestoreModal(null);
+                              const inputEl = document.getElementById('backup_csv_file_input');
+                              if (inputEl) inputEl.value = '';
+                            }}
+                            className="w-full py-2.5 rounded-xl bg-gray-100 hover:bg-gray-200 text-[#1E104B] text-xs font-bold transition-all"
+                          >
+                            Close
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
                 <button onClick={() => handleAction(() => exportCsv('exportAllLoanEmiRecordsCsv', 'all_loan_emi_records.csv'))} className="w-full text-left px-6 py-2.5 hover:bg-white transition-colors text-xs font-bold text-[#1E104B]"><i className="fa-solid fa-table-list w-7 text-[#7B2B8C]"></i> All Loan EMI Records</button>
                 <button onClick={() => handleAction(() => exportCsv('exportTransactionsCsv', 'transactions_export.csv'))} className="w-full text-left px-6 py-2.5 hover:bg-white transition-colors text-xs font-bold text-[#1E104B]"><i className="fa-solid fa-file-export w-7 text-[#625E70]"></i> All Transactions</button>
                 <button onClick={() => handleAction(() => exportCsv('exportIncomeSummaryCsv', 'income_summary.csv'))} className="w-full text-left px-6 py-2.5 hover:bg-white transition-colors text-xs font-bold text-[#1E104B]"><i className="fa-solid fa-arrow-trend-up w-7 text-[#078A87]"></i> Income Summary</button>
@@ -1256,25 +2021,6 @@ const AppBottomBranding = () => {
                 <button onClick={() => handleAction(() => exportCsv('exportAllIncomesCsv', 'all_incomes.csv'))} className="w-full text-left px-6 py-2.5 hover:bg-white transition-colors text-xs font-bold text-[#1E104B]"><i className="fa-solid fa-money-bill-trend-up w-7 text-[#078A87]"></i> All Incomes</button>
                 <button onClick={() => handleAction(() => exportCsv('exportReceivablesCsv', 'receivables_report.csv'))} className="w-full text-left px-6 py-2.5 hover:bg-white transition-colors text-xs font-bold text-[#1E104B]"><i className="fa-solid fa-hand-holding-dollar w-7 text-[#078A87]"></i> All Receivables</button>
                 <button onClick={() => handleAction(() => exportCsv('exportPayablesCsv', 'payables_report.csv'))} className="w-full text-left px-6 py-2.5 hover:bg-white transition-colors text-xs font-bold text-[#1E104B]"><i className="fa-solid fa-file-invoice-dollar w-7 text-[#D6455D]"></i> All Payables</button>
-
-                <div className="px-6 mt-4 mb-2 text-[10px] font-bold text-[#8A8596] uppercase tracking-widest">Backup & Restore</div>
-                <button onClick={() => handleAction(() => exportFullBackupCsv())} className="w-full text-left px-6 py-2.5 hover:bg-white transition-colors text-xs font-bold text-[#1E104B]"><i className="fa-solid fa-database w-7 text-[#7B2B8C]"></i> Full Data Backup (CSV)</button>
-                <label className="w-full flex items-center px-6 py-2.5 hover:bg-white transition-colors text-xs font-bold text-[#1E104B] cursor-pointer">
-                  <i className="fa-solid fa-file-import w-7 text-[#078A87]"></i> Restore from Backup
-                  <input
-                    type="file"
-                    accept=".csv,text/csv"
-                    className="hidden"
-                    onChange={(e) => {
-                      const file = e.target.files && e.target.files[0];
-                      e.target.value = '';
-                      if (!file) return;
-                      if (!window.confirm('Restoring a backup replaces all current data on this device. Continue?')) return;
-                      setIsMenuOpen(false);
-                      importFullBackupCsv(file);
-                    }}
-                  />
-                </label>
                 <SideMenuBranding />
               </div>
             )}
@@ -1353,6 +2099,16 @@ const AppBottomBranding = () => {
                           <label className="block text-[10px] font-bold text-[#625E70] uppercase mb-1">Name *</label>
                           <input type="text" required value={formData.name || ''} onChange={e => setFormData({ ...formData, name: e.target.value })} className="w-full border border-[#E4E1EA] rounded-xl px-3.5 py-2.5 font-bold text-sm bg-[#F4F3F8] focus:bg-white text-[#1E104B] outline-none" />
                         </div>
+                        {menuView === 'addPerson' && (
+                          <button
+                            type="button"
+                            onClick={() => pickContactForPerson(formData, setFormData)}
+                            className="w-full py-2.5 rounded-xl bg-[#078A87]/10 border border-[#078A87]/25 text-[#078A87] font-black text-xs flex items-center justify-center gap-2 active:scale-95 transition-all"
+                          >
+                            <i className="fa-solid fa-address-book"></i>
+                            <span>Pick from Android Contacts</span>
+                          </button>
+                        )}
                         <div>
                           <label className="block text-[10px] font-bold text-[#625E70] uppercase mb-1">Phone</label>
                           <input type="tel" value={formData.phone || ''} onChange={e => setFormData({ ...formData, phone: e.target.value })} className="w-full border border-[#E4E1EA] rounded-xl px-3.5 py-2.5 font-bold text-sm bg-[#F4F3F8] focus:bg-white text-[#1E104B] outline-none" />
@@ -1888,7 +2644,7 @@ const AppBottomBranding = () => {
             </div>
           </div>
 
-          {ReactDOM.createPortal(
+          {createPortal(
             <div className="canvas-hide">
               <div ref={summarySlipRef} id="persons-summary-slip" className="bg-white px-5 py-4 font-sans box-border inline-block text-slate-900 relative overflow-hidden" style={{ width: '640px', fontFamily: "'Noto Sans Devanagari', sans-serif" }}>
                 {/* Mid-Center Watermark (repeats vertically per page) */}
@@ -1899,7 +2655,7 @@ const AppBottomBranding = () => {
                   {Array.from({ length: Math.max(1, Math.ceil(((pData && pData.length) || 1) / 16)) }).map((_, wIdx) => (
                     <div key={wIdx} className="w-full flex items-center justify-center" style={{ minHeight: '820px' }}>
                       <img
-                        src={Array.isArray(APP_LOGO_COLORED) ? APP_LOGO_COLORED.join('') : APP_LOGO_COLORED}
+                        src={APP_LOGO_COLORED}
                         alt=""
                         className="w-72 h-72 object-contain select-none"
                         style={{ opacity: 0.05 }}
@@ -1985,7 +2741,7 @@ const AppBottomBranding = () => {
                       {/* Center Block: 2x Scaled App Logo */}
                       <div className="flex items-center justify-center">
                         <img
-                          src={Array.isArray(APP_LOGO_COLORED) ? APP_LOGO_COLORED.join('') : APP_LOGO_COLORED}
+                          src={APP_LOGO_COLORED}
                           alt="Logo"
                           className="w-[104px] h-[104px] object-contain select-none"
                         />
@@ -2472,7 +3228,7 @@ const AppBottomBranding = () => {
                 </div>
               )}
 
-              {ReactDOM.createPortal(
+              {createPortal(
                 <div className="canvas-hide">
                   <style>{`
                     #whatsapp-share-slip tr { page-break-inside: avoid !important; break-inside: avoid !important; }
@@ -2492,7 +3248,7 @@ const AppBottomBranding = () => {
                       {Array.from({ length: Math.max(1, Math.ceil(((txs && txs.length) || 1) / 10)) }).map((_, wIdx) => (
                         <div key={wIdx} className="w-full flex items-center justify-center" style={{ minHeight: '820px' }}>
                           <img
-                            src={Array.isArray(APP_LOGO_COLORED) ? APP_LOGO_COLORED.join('') : APP_LOGO_COLORED}
+                            src={APP_LOGO_COLORED}
                             alt=""
                             className="w-80 h-80 object-contain select-none"
                             style={{ opacity: 0.05 }}
@@ -2586,7 +3342,7 @@ const AppBottomBranding = () => {
                       {/* Center Block: 2x Scaled App Logo */}
                       <div className="flex items-center justify-center">
                         <img
-                          src={Array.isArray(APP_LOGO_COLORED) ? APP_LOGO_COLORED.join('') : APP_LOGO_COLORED}
+                          src={APP_LOGO_COLORED}
                           alt="Logo"
                           className="w-[104px] h-[104px] object-contain select-none"
                         />
@@ -3153,7 +3909,7 @@ const AppBottomBranding = () => {
               )}
             </div>
 
-            {ReactDOM.createPortal(
+            {createPortal(
               <div className="canvas-hide">
                 <div
                   ref={masterLoansSlipRef}
@@ -3169,7 +3925,7 @@ const AppBottomBranding = () => {
                     {Array.from({ length: Math.max(1, Math.ceil(((loans && loans.length) || 1) / 14)) }).map((_, wIdx) => (
                       <div key={wIdx} className="w-full flex items-center justify-center" style={{ minHeight: '820px' }}>
                         <img
-                          src={Array.isArray(APP_LOGO_COLORED) ? APP_LOGO_COLORED.join('') : APP_LOGO_COLORED}
+                          src={APP_LOGO_COLORED}
                           alt=""
                           className="w-72 h-72 object-contain select-none"
                           style={{ opacity: 0.05 }}
@@ -3258,7 +4014,7 @@ const AppBottomBranding = () => {
                       {/* Center Block: 2x Scaled App Logo */}
                       <div className="flex items-center justify-center">
                         <img
-                          src={Array.isArray(APP_LOGO_COLORED) ? APP_LOGO_COLORED.join('') : APP_LOGO_COLORED}
+                          src={APP_LOGO_COLORED}
                           alt="Logo"
                           className="w-[104px] h-[104px] object-contain select-none"
                         />
@@ -4018,7 +4774,7 @@ const AppBottomBranding = () => {
               </div>
             )}
 
-            {currentLoan && ReactDOM.createPortal(
+            {currentLoan && createPortal(
               <div className="canvas-hide">
                 {(() => {
                   const safeAdmin = typeof admin !== 'undefined' ? admin : {};
@@ -4041,7 +4797,7 @@ const AppBottomBranding = () => {
                         {Array.from({ length: Math.max(1, Math.ceil(((currentLoan.schedule && currentLoan.schedule.length) || 1) / 14)) }).map((_, wIdx) => (
                           <div key={wIdx} className="w-full flex items-center justify-center" style={{ minHeight: '820px' }}>
                             <img
-                              src={Array.isArray(APP_LOGO_COLORED) ? APP_LOGO_COLORED.join('') : APP_LOGO_COLORED}
+                              src={APP_LOGO_COLORED}
                               alt=""
                               className="w-80 h-auto max-h-48 object-contain select-none"
                               style={{ opacity: 0.05 }}
@@ -4158,7 +4914,7 @@ const AppBottomBranding = () => {
                         {/* Center Block: Proportional Scaled App Logo */}
                         <div className="flex items-center justify-center">
                           <img
-                            src={Array.isArray(APP_LOGO_COLORED) ? APP_LOGO_COLORED.join('') : APP_LOGO_COLORED}
+                            src={APP_LOGO_COLORED}
                             alt="Logo"
                             className="w-32 h-auto max-h-12 object-contain select-none"
                           />
@@ -5008,16 +5764,33 @@ const AppBottomBranding = () => {
 
       useEffect(() => {
         window.__TRIGGER_TAB__ = (targetTab) => {
+          const allowedTabs = new Set(['home', 'people', 'loans', 'records']);
           setSearchQuery('');
+          setSelectedTransaction(null);
+          setSelectedPerson(null);
           setFocusedLoan({ person: null, loanId: null });
-          setTab(targetTab);
+          setViewMode('master');
+          setIsCreatingLoan(false);
+          setTab(allowedTabs.has(targetTab) ? targetTab : 'home');
         };
         window.__TRIGGER_LOAN__ = (personName, loanId) => {
           setSearchQuery('');
+          setSelectedTransaction(null);
+          setSelectedPerson(null);
           setFocusedLoan({ person: personName, loanId: loanId });
+          setViewMode('detail');
+          setIsCreatingLoan(false);
           setTab('loans');
         };
+        return () => {
+          delete window.__TRIGGER_TAB__;
+          delete window.__TRIGGER_LOAN__;
+        };
       }, []);
+
+      useEffect(() => {
+        if (selectedPerson && !persons.some(p => p.name === selectedPerson.name)) setSelectedPerson(null);
+      }, [persons, selectedPerson]);
 
       const fullPersonList = useMemo(() => {
         return persons.map(p => {
@@ -5049,35 +5822,24 @@ const AppBottomBranding = () => {
 
       if (selectedPerson) {
         const refreshedPerson = fullPersonList.find(p => p.name === selectedPerson.name);
-        if (!refreshedPerson) {
-          setTimeout(() => setSelectedPerson(null), 0);
-          return null;
-        }
+        if (!refreshedPerson) return null;
         return (
           <div className="app-shell">
-            <ErrorBoundary key={refreshedPerson.name} label={refreshedPerson.name + "'s ledger"} onReset={() => setSelectedPerson(null)}>
-              <LedgerView
-                person={refreshedPerson}
-                onBack={() => setSelectedPerson(null)}
-                onSelectPerson={setSelectedPerson}
-                allPersons={fullPersonList}
-                onSelectTransaction={setSelectedTransaction}
-                onOpenAddRecord={() => setShowInput(true)}
-              />
-            </ErrorBoundary>
+            <LedgerView
+              person={refreshedPerson}
+              onBack={() => setSelectedPerson(null)}
+              onSelectPerson={setSelectedPerson}
+              allPersons={fullPersonList}
+              onSelectTransaction={setSelectedTransaction}
+              onOpenAddRecord={() => setShowInput(true)}
+            />
 
-            {showInput && (
-              <ErrorBoundary key="input-modal" label="New Entry" onReset={() => setShowInput(false)}>
-                <InputModal onClose={() => setShowInput(false)} />
-              </ErrorBoundary>
-            )}
+            {showInput && <InputModal onClose={() => setShowInput(false)} />}
             {selectedTransaction && (
-              <ErrorBoundary key="tx-modal" label="Transaction Details" onReset={() => setSelectedTransaction(null)}>
-                <TransactionDetailModal
-                  tx={selectedTransaction}
-                  onClose={() => setSelectedTransaction(null)}
-                />
-              </ErrorBoundary>
+              <TransactionDetailModal
+                tx={selectedTransaction}
+                onClose={() => setSelectedTransaction(null)}
+              />
             )}
 
             <div className="notched-nav-container select-none">
@@ -5179,60 +5941,38 @@ const AppBottomBranding = () => {
 
           <div className="app-content">
             {searchQuery.trim().length > 0 && !isIndvLoanDetail ? (
-              <ErrorBoundary key="search" label="Search">
-                <SearchView onSelectPerson={setSelectedPerson} onSelectTransaction={setSelectedTransaction} />
-              </ErrorBoundary>
+              <SearchView onSelectPerson={setSelectedPerson} onSelectTransaction={setSelectedTransaction} />
             ) : (
               <>
                 {tab === 'home' && (
-                  <ErrorBoundary key="home" label="Home" onReset={() => refresh(false, false)}>
-                    <HomeView
-                      onSelectPerson={setSelectedPerson}
-                      onSelectTransaction={setSelectedTransaction}
-                      onNavigateTab={(t) => {
-                        if (window.__TRIGGER_TAB__) window.__TRIGGER_TAB__(t);
-                        else setTab(t);
-                      }}
-                    />
-                  </ErrorBoundary>
+                  <HomeView
+                    onSelectPerson={setSelectedPerson}
+                    onSelectTransaction={setSelectedTransaction}
+                    onNavigateTab={(t) => {
+                      if (window.__TRIGGER_TAB__) window.__TRIGGER_TAB__(t);
+                      else setTab(t);
+                    }}
+                  />
                 )}
-                {tab === 'people' && (
-                  <ErrorBoundary key="people" label="Persons">
-                    <PersonsView onSelectPerson={setSelectedPerson} />
-                  </ErrorBoundary>
-                )}
+                {tab === 'people' && <PersonsView onSelectPerson={setSelectedPerson} />}
                 {tab === 'loans' && (
-                  <ErrorBoundary key={'loans-' + (focusedLoan.loanId || 'master')} label="Loans / EMIs" onReset={() => setFocusedLoan({ person: null, loanId: null })}>
-                    <LoanManagerView
-                      key={focusedLoan.loanId || 'master'}
-                      onSelectPerson={setSelectedPerson}
-                      initialPersonFilter={focusedLoan.person}
-                      initialLoanId={focusedLoan.loanId}
-                      onClearLoanFocus={() => setFocusedLoan({ person: null, loanId: null })}
-                      viewModeState={[viewMode, setViewMode]}
-                      isCreatingLoanState={[isCreatingLoan, setIsCreatingLoan]}
-                    />
-                  </ErrorBoundary>
+                  <LoanManagerView
+                    key={focusedLoan.loanId || 'master'}
+                    onSelectPerson={setSelectedPerson}
+                    initialPersonFilter={focusedLoan.person}
+                    initialLoanId={focusedLoan.loanId}
+                    onClearLoanFocus={() => setFocusedLoan({ person: null, loanId: null })}
+                    viewModeState={[viewMode, setViewMode]}
+                    isCreatingLoanState={[isCreatingLoan, setIsCreatingLoan]}
+                  />
                 )}
-                {tab === 'records' && (
-                  <ErrorBoundary key="records" label="Records">
-                    <RecordsView onSelectTransaction={setSelectedTransaction} />
-                  </ErrorBoundary>
-                )}
+                {tab === 'records' && <RecordsView onSelectTransaction={setSelectedTransaction} />}
               </>
             )}
           </div>
 
-          {showInput && (
-            <ErrorBoundary key="input-modal" label="New Entry" onReset={() => setShowInput(false)}>
-              <InputModal onClose={() => setShowInput(false)} />
-            </ErrorBoundary>
-          )}
-          {selectedTransaction && (
-            <ErrorBoundary key="tx-modal" label="Transaction Details" onReset={() => setSelectedTransaction(null)}>
-              <TransactionDetailModal tx={selectedTransaction} onClose={() => setSelectedTransaction(null)} />
-            </ErrorBoundary>
-          )}
+          {showInput && <InputModal onClose={() => setShowInput(false)} />}
+          {selectedTransaction && <TransactionDetailModal tx={selectedTransaction} onClose={() => setSelectedTransaction(null)} />}
 
           {/* Notched Orbit Navigation Bar */}
           <div className="notched-nav-container select-none">
@@ -5324,12 +6064,10 @@ const AppBottomBranding = () => {
       );
     };
 
-    initDB().then(() => {
-      ReactDOM.createRoot(document.getElementById('root')).render(
-        <ErrorBoundary label="Budget Bharat">
-          <AppProvider>
-            <MainApp />
-          </AppProvider>
-        </ErrorBoundary>
-      );
-    });
+    createRoot(document.getElementById('root')).render(
+      <AppErrorBoundary>
+        <AppProvider>
+          <MainApp />
+        </AppProvider>
+      </AppErrorBoundary>
+    );
