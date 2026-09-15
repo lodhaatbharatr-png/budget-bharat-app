@@ -1,299 +1,297 @@
-
 import { Capacitor } from '@capacitor/core';
 import { CapacitorSQLite, SQLiteConnection } from '@capacitor-community/sqlite';
 
-let db = null;
-const STORAGE_KEY = 'budget_bharat_sqlite_fallback_v1';
+const DB_NAME = 'budget_bharat';
+const STORAGE_KEY = 'budget_bharat_state_v1';
+const DEFAULT_STATE = Object.freeze({
+  transactions: [],
+  persons: [],
+  categories: {
+    expense: [],
+    income: []
+  },
+  admin: {},
+  loans: []
+});
 
-const getFallbackData = () => {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) return JSON.parse(raw);
-  } catch (e) {}
+let sqlite = null;
+let db = null;
+let initPromise = null;
+
+const cloneDefaultState = () => ({
+  transactions: [],
+  persons: [],
+  categories: { expense: [], income: [] },
+  admin: {},
+  loans: []
+});
+
+const normalizeState = (value) => {
+  const source = value && typeof value === 'object' ? value : {};
   return {
-    transactions: [
-      { id: '1', type: 'EXPENSE', amount: 450, category: 'Food', person: 'Self', date: '14/09/2026', note: 'Lunch', ref: 'Cash' },
-      { id: '2', type: 'INCOME', amount: 25000, category: 'Salary', person: 'Employer', date: '01/09/2026', note: 'Monthly Salary', ref: 'Bank' }
-    ],
-    persons: [
-      { id: 'p1', name: 'Self', phone: '', email: '', address: 'Maharashtra' },
-      { id: 'p2', name: 'Employer', phone: '', email: '', address: 'Maharashtra' }
-    ],
-    loans: [],
+    transactions: Array.isArray(source.transactions) ? source.transactions : [],
+    persons: Array.isArray(source.persons) ? source.persons : [],
     categories: {
-      expense: ['Food', 'Rent', 'Utilities', 'Shopping', 'Transport'],
-      income: ['Salary', 'Freelance', 'Investments', 'Gift']
+      expense: Array.isArray(source.categories?.expense) ? source.categories.expense : [],
+      income: Array.isArray(source.categories?.income) ? source.categories.income : []
     },
-    admin: { name: 'Bharat Rasve', contact: '7218838122', email: '', headerNote: 'Official Accounting Summary', footerNote: 'Thank you for your business' }
+    admin: source.admin && typeof source.admin === 'object' ? source.admin : {},
+    loans: Array.isArray(source.loans) ? source.loans : []
   };
 };
 
-const saveFallbackData = (data) => {
+const readFallback = () => {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-  } catch (e) {}
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return raw ? normalizeState(JSON.parse(raw)) : cloneDefaultState();
+  } catch (error) {
+    console.warn('Unable to read local fallback state.', error);
+    return cloneDefaultState();
+  }
+};
+
+const writeFallback = (state) => {
+  const normalized = normalizeState(state);
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(normalized));
+  } catch (error) {
+    console.warn('Unable to persist local fallback state.', error);
+  }
+  return normalized;
+};
+
+const nativeAvailable = () => {
+  try {
+    return Boolean(Capacitor?.isNativePlatform?.());
+  } catch (_) {
+    return false;
+  }
+};
+
+const readNative = async () => {
+  if (!db) return null;
+  const result = await db.query(
+    'SELECT value FROM app_state WHERE id = 1 LIMIT 1'
+  );
+  const raw = result?.values?.[0]?.value;
+  if (!raw) return null;
+  try {
+    return normalizeState(JSON.parse(raw));
+  } catch (error) {
+    console.warn('Stored SQLite state is invalid; using empty state.', error);
+    return null;
+  }
+};
+
+const writeNative = async (state) => {
+  if (!db) return normalizeState(state);
+  const normalized = normalizeState(state);
+  await db.run(
+    'INSERT OR REPLACE INTO app_state (id, value) VALUES (1, ?)',
+    [JSON.stringify(normalized)]
+  );
+  return normalized;
 };
 
 export const initDB = async () => {
-  if (db) return db;
-  try {
-    if (Capacitor.isNativePlatform()) {
-      const sqlite = new SQLiteConnection(CapacitorSQLite);
-      const ret = await sqlite.checkConnectionsConsistency();
-      const isConn = (await sqlite.isConnection('budget_bharat_db', false)).result;
-      if (isConn) {
-        db = await sqlite.createConnection('budget_bharat_db', false, 'no-encryption', 1, false);
-      } else {
-        db = await sqlite.createConnection('budget_bharat_db', false, 'no-encryption', 1, false);
-      }
+  if (initPromise) return initPromise;
+
+  initPromise = (async () => {
+    if (!nativeAvailable()) return null;
+
+    try {
+      sqlite = new SQLiteConnection(CapacitorSQLite);
+      const consistency = await sqlite.checkConnectionsConsistency();
+      const connected = Boolean(consistency?.result) &&
+        Boolean((await sqlite.isConnection(DB_NAME, false))?.result);
+
+      db = connected
+        ? await sqlite.retrieveConnection(DB_NAME, false)
+        : await sqlite.createConnection(DB_NAME, false, 'no-encryption', 1, false);
+
       await db.open();
       await db.execute(`
-        CREATE TABLE IF NOT EXISTS app_data (
-          key TEXT PRIMARY KEY,
-          value TEXT
+        CREATE TABLE IF NOT EXISTS app_state (
+          id INTEGER PRIMARY KEY NOT NULL,
+          value TEXT NOT NULL
         );
       `);
+
+      // Migrate an existing web/fallback state into native SQLite once,
+      // but never invent starter/sample records.
+      const nativeState = await readNative();
+      if (!nativeState) {
+        const fallbackState = readFallback();
+        if (JSON.stringify(fallbackState) !== JSON.stringify(DEFAULT_STATE)) {
+          await writeNative(fallbackState);
+        }
+      }
+
+      return db;
+    } catch (error) {
+      console.warn('Native SQLite unavailable; using localStorage fallback.', error);
+      db = null;
+      return null;
     }
-  } catch (e) {
-    console.warn('Native SQLite unavailable, using web fallback store.', e);
+  })();
+
+  return initPromise;
+};
+
+export const readState = async () => {
+  try {
+    await initDB();
+    const nativeState = await readNative();
+    if (nativeState) return nativeState;
+  } catch (error) {
+    console.warn('SQLite read failed; falling back to localStorage.', error);
   }
-  return db;
+  return readFallback();
 };
 
-/** ============ CSV HELPERS ============
- * Shared by every export method below. Mirrors the escaping/section
- * conventions used by the full-backup exporter in main.jsx so a person
- * opening any of these CSVs in Excel/Sheets sees consistent formatting.
- */
-const csvEscape = (v) => {
-  const s = (v === null || v === undefined) ? '' : String(v);
-  return (s.includes(',') || s.includes('"') || s.includes('\n')) ? '"' + s.replace(/"/g, '""') + '"' : s;
+export const writeState = async (state) => {
+  const normalized = normalizeState(state);
+  try {
+    await initDB();
+    if (db) return await writeNative(normalized);
+  } catch (error) {
+    console.warn('SQLite write failed; using localStorage fallback.', error);
+  }
+  return writeFallback(normalized);
 };
 
-const rowsToCsv = (headers, rows) => [headers.join(',')]
-  .concat(rows.map(r => headers.map(h => csvEscape(r[h])).join(',')))
-  .join('\n');
-
-const flowSummaryCsv = (transactions, type) => {
-  const rows = transactions.filter(t => t.type === type);
-  const total = rows.reduce((s, t) => s + (Number(t.amount) || 0), 0);
-  const map = {};
-  rows.forEach(t => {
-    const key = t.category || '(Uncategorized)';
-    if (!map[key]) map[key] = { amount: 0, count: 0 };
-    map[key].amount += Number(t.amount) || 0;
-    map[key].count += 1;
-  });
-  const out = Object.keys(map)
-    .sort((a, b) => map[b].amount - map[a].amount)
-    .map(k => ({
-      Category: k,
-      'Total Amount': map[k].amount,
-      'Transaction Count': map[k].count,
-      '% of Total': total ? ((map[k].amount / total) * 100).toFixed(1) + '%' : '0.0%'
-    }));
-  out.push({ Category: 'TOTAL', 'Total Amount': total, 'Transaction Count': rows.length, '% of Total': '100.0%' });
-  return rowsToCsv(['Category', 'Total Amount', 'Transaction Count', '% of Total'], out);
+export const resetState = async () => {
+  const empty = cloneDefaultState();
+  return writeState(empty);
 };
-
-const personsBalances = (persons, transactions) => persons.map(p => {
-  let dr = 0, cr = 0;
-  transactions.filter(t => t.person === p.name).forEach(t => {
-    if (t.type === 'LENT') dr += Number(t.amount) || 0;
-    if (t.type === 'BORROW') cr += Number(t.amount) || 0;
-  });
-  const bal = dr - cr;
-  return { ...p, totalDr: dr, totalCr: cr, remaining: bal, status: bal > 0 ? 'RECEIVABLE' : bal < 0 ? 'PAYABLE' : 'SETTLED' };
-});
 
 export const BackendBridge = {
-  getDashboardPayload: async () => {
-    return getFallbackData();
-  },
+  getDashboardPayload: readState,
+
   addTransaction: async (tx) => {
-    const data = getFallbackData();
-    const newTx = { ...tx, id: 'tx_' + Date.now() };
-    data.transactions.unshift(newTx);
-    saveFallbackData(data);
-    return data;
-  },
-  updateTransaction: async (tx) => {
-    const data = getFallbackData();
-    data.transactions = data.transactions.map(t => (String(t.id || t.entryId) === String(tx.id || tx.entryId) ? { ...t, ...tx } : t));
-    saveFallbackData(data);
-    return data;
-  },
-  deleteTransaction: async (id) => {
-    const data = getFallbackData();
-    data.transactions = data.transactions.filter(t => String(t.id || t.entryId) !== String(id));
-    saveFallbackData(data);
-    return data;
-  },
-  addPerson: async (p) => {
-    const data = getFallbackData();
-    if (!data.persons.some(item => item.name.toLowerCase() === p.name.toLowerCase())) {
-      data.persons.push({ id: 'p_' + Date.now(), ...p });
-      saveFallbackData(data);
-    }
-    return data;
-  },
-  updatePerson: async (p) => {
-    const data = getFallbackData();
-    data.persons = data.persons.map(item => (item.name === p.oldName ? { ...item, ...p } : item));
-    saveFallbackData(data);
-    return data;
-  },
-  deletePerson: async (name) => {
-    const data = getFallbackData();
-    data.persons = data.persons.filter(p => p.name !== name);
-    data.transactions = data.transactions.filter(t => t.person !== name);
-    saveFallbackData(data);
-    return data;
-  },
-  addCategory: async (type, name) => {
-    const data = getFallbackData();
-    const target = type === 'income' ? data.categories.income : data.categories.expense;
-    if (!target.includes(name)) {
-      target.push(name);
-      saveFallbackData(data);
-    }
-    return data;
-  },
-  updateCategory: async (oldData, newData) => {
-    const data = getFallbackData();
-    const target = oldData.type === 'income' ? data.categories.income : data.categories.expense;
-    const idx = target.indexOf(oldData.oldName);
-    if (idx !== -1) target[idx] = newData.newName;
-    saveFallbackData(data);
-    return data;
-  },
-  deleteCategory: async (catData) => {
-    const data = getFallbackData();
-    const target = catData.type === 'income' ? data.categories.income : data.categories.expense;
-    const idx = target.indexOf(catData.name);
-    if (idx !== -1) target.splice(idx, 1);
-    saveFallbackData(data);
-    return data;
-  },
-  updateAdminConfig: async (admin) => {
-    const data = getFallbackData();
-    data.admin = { ...data.admin, ...admin };
-    saveFallbackData(data);
-    return data;
-  },
-  saveLoan: async (loan) => {
-    const data = getFallbackData();
-    const idx = data.loans.findIndex(l => l.id === loan.id);
-    if (idx >= 0) {
-      data.loans[idx] = loan;
-    } else {
-      data.loans.unshift(loan);
-    }
-    saveFallbackData(data);
-    return data;
-  },
-  deleteLoan: async (loanId) => {
-    const data = getFallbackData();
-    data.loans = data.loans.filter(l => l.id !== loanId);
-    saveFallbackData(data);
-    return data;
-  },
-
-  /** ============ FULL BACKUP RESTORE ============
-   * Replaces ALL current data (including the starter sample rows) with
-   * whatever was parsed from an imported backup CSV. Any section missing
-   * from the file falls back to an empty shape rather than throwing.
-   */
-  restoreFullBackup: async (parsed) => {
-    const merged = {
-      transactions: Array.isArray(parsed.transactions) ? parsed.transactions : [],
-      persons: Array.isArray(parsed.persons) ? parsed.persons : [],
-      categories: {
-        expense: (parsed.categories && Array.isArray(parsed.categories.expense)) ? parsed.categories.expense : [],
-        income: (parsed.categories && Array.isArray(parsed.categories.income)) ? parsed.categories.income : []
-      },
-      loans: Array.isArray(parsed.loans) ? parsed.loans : [],
-      admin: parsed.admin && typeof parsed.admin === 'object' ? parsed.admin : {}
+    const state = await readState();
+    const next = {
+      ...state,
+      transactions: [
+        { ...tx, id: tx?.id || `tx_${Date.now()}` },
+        ...state.transactions
+      ]
     };
-    saveFallbackData(merged);
-    return merged;
+    return writeState(next);
   },
 
-  /** ============ CSV EXPORTS ============
-   * These were previously called via gasRun(...) but had no matching
-   * method here (leftover from the Google Apps Script backend), so every
-   * export button in the side menu silently downloaded an empty/broken
-   * file. Implemented client-side now against the same fallback data.
-   */
-  exportTransactionsCsv: async () => {
-    const { transactions } = getFallbackData();
-    return rowsToCsv(['id', 'type', 'amount', 'category', 'person', 'date', 'note', 'ref', 'promiseDate'], transactions);
+  updateTransaction: async (tx) => {
+    const state = await readState();
+    const id = String(tx?.id || tx?.entryId || '');
+    const next = {
+      ...state,
+      transactions: state.transactions.map(item =>
+        String(item.id || item.entryId || '') === id ? { ...item, ...tx } : item
+      )
+    };
+    return writeState(next);
   },
-  exportIncomeSummaryCsv: async () => {
-    const { transactions } = getFallbackData();
-    return flowSummaryCsv(transactions, 'INCOME');
-  },
-  exportExpenseSummaryCsv: async () => {
-    const { transactions } = getFallbackData();
-    return flowSummaryCsv(transactions, 'EXPENSE');
-  },
-  exportAllExpensesCsv: async () => {
-    const { transactions } = getFallbackData();
-    return rowsToCsv(['id', 'date', 'category', 'amount', 'note', 'ref'], transactions.filter(t => t.type === 'EXPENSE'));
-  },
-  exportAllIncomesCsv: async () => {
-    const { transactions } = getFallbackData();
-    return rowsToCsv(['id', 'date', 'category', 'amount', 'note', 'ref'], transactions.filter(t => t.type === 'INCOME'));
-  },
-  exportPersonsSummaryCsv: async () => {
-    const { persons, transactions } = getFallbackData();
-    const rows = personsBalances(persons, transactions)
-      .sort((a, b) => Math.abs(b.remaining) - Math.abs(a.remaining))
-      .map(p => ({
-        Person: p.name, Phone: p.phone, Address: p.address,
-        'Total Given (Dr)': p.totalDr, 'Total Received (Cr)': p.totalCr,
-        Balance: Math.abs(p.remaining), Status: p.status
-      }));
-    return rowsToCsv(['Person', 'Phone', 'Address', 'Total Given (Dr)', 'Total Received (Cr)', 'Balance', 'Status'], rows);
-  },
-  exportReceivablesCsv: async () => {
-    const { persons, transactions } = getFallbackData();
-    const rows = personsBalances(persons, transactions)
-      .filter(p => p.remaining > 0)
-      .sort((a, b) => b.remaining - a.remaining)
-      .map(p => ({ Person: p.name, Phone: p.phone, 'Amount Receivable': p.remaining }));
-    return rowsToCsv(['Person', 'Phone', 'Amount Receivable'], rows);
-  },
-  exportPayablesCsv: async () => {
-    const { persons, transactions } = getFallbackData();
-    const rows = personsBalances(persons, transactions)
-      .filter(p => p.remaining < 0)
-      .sort((a, b) => Math.abs(b.remaining) - Math.abs(a.remaining))
-      .map(p => ({ Person: p.name, Phone: p.phone, 'Amount Payable': Math.abs(p.remaining) }));
-    return rowsToCsv(['Person', 'Phone', 'Amount Payable'], rows);
-  },
-  exportActiveLoansSummaryCsv: async () => {
-    const { loans } = getFallbackData();
-    const rows = loans.map(l => {
-      const schedule = l.schedule || [];
-      const paid = schedule.filter(s => s.paid).length;
-      return {
-        'Loan Name': l.loanName, Person: l.person, 'Loan Amount': l.loanAmount,
-        'Monthly EMI': l.monthlyEmi, 'EMI Paid': `${paid}/${schedule.length}`, Status: l.status
-      };
+
+  deleteTransaction: async (id) => {
+    const state = await readState();
+    return writeState({
+      ...state,
+      transactions: state.transactions.filter(item =>
+        String(item.id || item.entryId || '') !== String(id)
+      )
     });
-    return rowsToCsv(['Loan Name', 'Person', 'Loan Amount', 'Monthly EMI', 'EMI Paid', 'Status'], rows);
   },
-  exportAllLoanEmiRecordsCsv: async () => {
-    const { loans } = getFallbackData();
-    const rows = [];
-    loans.forEach(l => (l.schedule || []).forEach(s => {
-      rows.push({
-        'Loan Name': l.loanName, Person: l.person, 'EMI No': s.emiNo, Date: s.date,
-        'EMI Amount': s.emiAmount, 'Outstanding Bal': s.outstandingBal, Paid: s.paid ? 'Yes' : 'No',
-        'Who Paid': s.whoPaid, 'Txn Id': s.paymentId, 'Paid Date': s.paidDate
-      });
-    }));
-    return rowsToCsv(['Loan Name', 'Person', 'EMI No', 'Date', 'EMI Amount', 'Outstanding Bal', 'Paid', 'Who Paid', 'Txn Id', 'Paid Date'], rows);
+
+  addPerson: async (person) => {
+    const state = await readState();
+    const name = String(person?.name || '').trim();
+    if (!name) return state;
+    if (state.persons.some(item => String(item.name || '').toLowerCase() === name.toLowerCase())) {
+      return state;
+    }
+    return writeState({
+      ...state,
+      persons: [...state.persons, { id: person.id || `p_${Date.now()}`, ...person, name }]
+    });
+  },
+
+  updatePerson: async (person) => {
+    const state = await readState();
+    const oldName = person?.oldName;
+    return writeState({
+      ...state,
+      persons: state.persons.map(item => item.name === oldName ? { ...item, ...person } : item)
+    });
+  },
+
+  deletePerson: async (name) => {
+    const state = await readState();
+    return writeState({
+      ...state,
+      persons: state.persons.filter(person => person.name !== name),
+      transactions: state.transactions.filter(tx => tx.person !== name)
+    });
+  },
+
+  addCategory: async (type, name) => {
+    const state = await readState();
+    const key = type === 'income' ? 'income' : 'expense';
+    if (!name || state.categories[key].includes(name)) return state;
+    return writeState({
+      ...state,
+      categories: { ...state.categories, [key]: [...state.categories[key], name] }
+    });
+  },
+
+  updateCategory: async (oldData, newData) => {
+    const state = await readState();
+    const key = oldData?.type === 'income' ? 'income' : 'expense';
+    return writeState({
+      ...state,
+      categories: {
+        ...state.categories,
+        [key]: state.categories[key].map(item => item === oldData?.oldName ? newData?.newName : item)
+      }
+    });
+  },
+
+  deleteCategory: async (catData) => {
+    const state = await readState();
+    const key = catData?.type === 'income' ? 'income' : 'expense';
+    return writeState({
+      ...state,
+      categories: {
+        ...state.categories,
+        [key]: state.categories[key].filter(item => item !== catData?.name)
+      }
+    });
+  },
+
+  updateAdminConfig: async (admin) => {
+    const state = await readState();
+    return writeState({ ...state, admin: { ...state.admin, ...admin } });
+  },
+
+  saveLoan: async (loan) => {
+    const state = await readState();
+    const index = state.loans.findIndex(item => item.id === loan?.id);
+    const loans = [...state.loans];
+    if (index >= 0) loans[index] = loan;
+    else loans.unshift(loan);
+    return writeState({ ...state, loans });
+  },
+
+  deleteLoan: async (loanId) => {
+    const state = await readState();
+    return writeState({
+      ...state,
+      loans: state.loans.filter(loan => loan.id !== loanId)
+    });
+  },
+
+  restoreFullBackup: async (parsed) => {
+    // The caller is responsible for validating the complete backup format.
+    // This method only writes the already-parsed replacement state atomically.
+    return writeState(normalizeState(parsed));
   }
 };
