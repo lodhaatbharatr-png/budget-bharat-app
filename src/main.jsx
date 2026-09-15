@@ -10,7 +10,7 @@ import { createPortal } from 'react-dom';
 import { createRoot } from 'react-dom/client';
 import html2canvas from 'html2canvas';
 import html2pdf from 'html2pdf.js';
-import { Capacitor, CapacitorException } from '@capacitor/core';
+import { Capacitor } from '@capacitor/core';
 import { CapacitorSQLite, SQLiteConnection } from '@capacitor-community/sqlite';
 
 const INCOME_TYPES = ['INCOME', 'BORROW'];
@@ -2183,6 +2183,7 @@ const INCOME_TYPES = ['INCOME', 'BORROW'];
       if (!rows.length || !String(rows[0][0] || '').includes('PRO_BUDGET_BHARAT_BACKUP')) {
         throw new Error('The selected file is not a valid Pro Budget Bharat multi-sheet backup CSV.');
       }
+
       const sheets = {};
       let current = null;
       rows.forEach(row => {
@@ -2190,6 +2191,7 @@ const INCOME_TYPES = ['INCOME', 'BORROW'];
         const match = first.match(/^### SHEET:\s*([^#]+?)\s*###$/);
         if (match) {
           current = match[1].trim();
+          if (sheets[current]) throw new Error('Duplicate backup sheet: ' + current);
           sheets[current] = [];
           return;
         }
@@ -2200,92 +2202,87 @@ const INCOME_TYPES = ['INCOME', 'BORROW'];
         if (current) sheets[current].push(row);
       });
 
+      const requiredSheets = ['TRANS_RECORD', 'Person_Config', 'Category', 'Admin_config', 'LOANS_MASTER', 'Loan_EMI_Records'];
+      const missingSheets = requiredSheets.filter(name => !Array.isArray(sheets[name]));
+      if (missingSheets.length) throw new Error('Backup is incomplete. Missing: ' + missingSheets.join(', '));
+
+      const headerEquals = (actual, expected) => actual.length === expected.length && expected.every((h, i) => String(actual[i] || '').trim() === h);
+      const nonEmptyRows = data => data.filter(r => r.some(v => String(v ?? '').trim() !== ''));
+      const readSheet = (name, expectedHeaders) => {
+        const data = sheets[name] || [];
+        if (!headerEquals(data[0] || [], expectedHeaders)) throw new Error('Invalid schema in backup sheet: ' + name);
+        return nonEmptyRows(data.slice(1));
+      };
+
+      const txRows = readSheet('TRANS_RECORD', LOCAL_HEADERS.transactions);
+      const pRows = readSheet('Person_Config', LOCAL_HEADERS.persons);
+      const cRows = readSheet('Category', LOCAL_HEADERS.categories);
+      const aRows = readSheet('Admin_config', LOCAL_HEADERS.admin);
+      const lRows = readSheet('LOANS_MASTER', LOCAL_HEADERS.loans);
+      const eRows = readSheet('Loan_EMI_Records', LOCAL_HEADERS.emi);
       const next = cloneLocalState(DEFAULT_LOCAL_STATE);
-      const txRows = sheets.TRANS_RECORD || [];
-      const txHeader = txRows.shift() || LOCAL_HEADERS.transactions;
-      const txIdx = name => txHeader.indexOf(name);
-      next.transactions = txRows.filter(r => r.some(Boolean)).map((r, idx) => ({
-        id: String(r[txIdx('ENTRY_ID')] || ('row_' + (idx + 1))),
-        entryId: String(r[txIdx('ENTRY_ID')] || ('row_' + (idx + 1))),
-        type: String(r[txIdx('Transaction Type')] || '').toUpperCase() === 'GIVEN' ? 'LENT' :
-          String(r[txIdx('Transaction Type')] || '').toUpperCase() === 'RECEIVED' ? 'BORROW' :
-          String(r[txIdx('Transaction Type')] || '').toUpperCase(),
-        date: String(r[txIdx('Date')] || ''),
-        amount: Number(r[txIdx('Amount')]) || 0,
-        person: String(r[txIdx('Person')] || ''),
-        category: String(r[txIdx('Category')] || ''),
-        note: String(r[txIdx('Description')] || ''),
-        ref: String(r[txIdx('Reference A/c')] || ''),
-        promiseDate: String(r[txIdx('Promise Date')] || '')
-      }));
 
-      const pRows = sheets.Person_Config || [];
-      const pHeader = pRows.shift() || LOCAL_HEADERS.persons;
-      const pIdx = name => pHeader.indexOf(name);
-      next.persons = pRows.filter(r => r.some(Boolean)).map((r, idx) => ({
-        id: String(r[pIdx('Person ID')] || ('PID_LOCAL_' + (idx + 1))),
-        personId: String(r[pIdx('Person ID')] || ('PID_LOCAL_' + (idx + 1))),
-        name: String(r[pIdx('Person')] || ''),
-        phone: String(r[pIdx('Mobile No.')] || ''),
-        address: String(r[pIdx('ADDRESS')] || ''),
-        email: String(r[pIdx('Email Id')] || '')
-      })).filter(p => p.name);
+      const txIdx = Object.fromEntries(LOCAL_HEADERS.transactions.map((h, i) => [h, i]));
+      const transactionIds = new Set();
+      next.transactions = txRows.map((r, idx) => {
+        const id = String(r[txIdx['ENTRY_ID']] || ('row_' + (idx + 1))).trim();
+        if (!id) throw new Error('A transaction row has no ENTRY_ID.');
+        if (transactionIds.has(id)) throw new Error('Duplicate transaction ENTRY_ID: ' + id);
+        transactionIds.add(id);
+        const rawType = String(r[txIdx['Transaction Type']] || '').trim().toUpperCase();
+        const type = rawType === 'GIVEN' ? 'LENT' : rawType === 'RECEIVED' ? 'BORROW' : rawType;
+        if (!['EXPENSE', 'INCOME', 'LENT', 'BORROW'].includes(type)) throw new Error('Invalid transaction type in backup: ' + rawType);
+        return { id, entryId: id, type, date: String(r[txIdx['Date']] || ''), amount: Number(r[txIdx['Amount']]) || 0, person: String(r[txIdx['Person']] || ''), category: String(r[txIdx['Category']] || ''), note: String(r[txIdx['Description']] || ''), ref: String(r[txIdx['Reference A/c']] || ''), promiseDate: String(r[txIdx['Promise Date']] || '') };
+      });
 
-      const cRows = sheets.Category || [];
-      const cHeader = cRows.shift() || LOCAL_HEADERS.categories;
-      const expIdx = cHeader.indexOf('Expense Type');
-      const incIdx = cHeader.indexOf('Income type');
-      next.categories.expense = cRows.map(r => String(r[expIdx] || '').trim()).filter(Boolean);
-      next.categories.income = cRows.map(r => String(r[incIdx] || '').trim()).filter(Boolean);
+      const pIdx = Object.fromEntries(LOCAL_HEADERS.persons.map((h, i) => [h, i]));
+      const personIds = new Set();
+      const personNames = new Set();
+      next.persons = pRows.map((r, idx) => {
+        const id = String(r[pIdx['Person ID']] || ('PID_LOCAL_' + (idx + 1))).trim();
+        const name = String(r[pIdx['Person']] || '').trim();
+        if (!name) throw new Error('A person row has no name.');
+        if (personIds.has(id)) throw new Error('Duplicate Person ID: ' + id);
+        if (personNames.has(name.toLowerCase())) throw new Error('Duplicate person name: ' + name);
+        personIds.add(id); personNames.add(name.toLowerCase());
+        return { id, personId: id, name, phone: String(r[pIdx['Mobile No.']] || ''), address: String(r[pIdx['ADDRESS']] || ''), email: String(r[pIdx['Email Id']] || '') };
+      });
 
-      const aRows = sheets.Admin_config || [];
-      const aHeader = aRows.shift() || LOCAL_HEADERS.admin;
-      if (aRows[0]) {
-        next.admin = {
-          name: String(aRows[0][aHeader.indexOf('NAME')] || ''),
-          contact: String(aRows[0][aHeader.indexOf('CONTACT')] || ''),
-          email: String(aRows[0][aHeader.indexOf('Email id')] || ''),
-          headerNote: String(aRows[0][aHeader.indexOf('Statement Header note')] || ''),
-          footerNote: String(aRows[0][aHeader.indexOf('Statement Footer note')] || '')
-        };
-      }
+      const cIdx = Object.fromEntries(LOCAL_HEADERS.categories.map((h, i) => [h, i]));
+      next.categories.expense = [...new Set(cRows.map(r => String(r[cIdx['Expense Type']] || '').trim()).filter(Boolean))];
+      next.categories.income = [...new Set(cRows.map(r => String(r[cIdx['Income type']] || '').trim()).filter(Boolean))];
 
-      const lRows = sheets.LOANS_MASTER || [];
-      const lHeader = lRows.shift() || LOCAL_HEADERS.loans;
-      const li = name => lHeader.indexOf(name);
-      next.loans = lRows.filter(r => r.some(Boolean)).map(r => ({
-        id: String(r[li('Loan ID')] || ''),
-        person: String(r[li('Person')] || ''),
-        loanName: String(r[li('Loan Name')] || ''),
-        principalAmount: Number(r[li('Loan Taken')]) || 0,
-        loanAmount: Number(r[li('Loan to Pay')]) || 0,
-        monthlyEmi: Number(r[li('Monthly EMI')]) || 0,
-        tenureMonths: Number(r[li('Tenure Months')]) || 0,
-        firstEmiDate: String(r[li('First EMI Date')] || ''),
-        status: String(r[li('Status')] || 'ACTIVE').toUpperCase(),
-        schedule: []
-      })).filter(l => l.id);
+      const aIdx = Object.fromEntries(LOCAL_HEADERS.admin.map((h, i) => [h, i]));
+      if (aRows[0]) next.admin = { name: String(aRows[0][aIdx['NAME']] || ''), contact: String(aRows[0][aIdx['CONTACT']] || ''), email: String(aRows[0][aIdx['Email id']] || ''), headerNote: String(aRows[0][aIdx['Statement Header note']] || ''), footerNote: String(aRows[0][aIdx['Statement Footer note']] || '') };
 
-      const eRows = sheets.Loan_EMI_Records || [];
-      const eHeader = eRows.shift() || LOCAL_HEADERS.emi;
-      const ei = name => eHeader.indexOf(name);
+      const lIdx = Object.fromEntries(LOCAL_HEADERS.loans.map((h, i) => [h, i]));
+      const loanIds = new Set();
+      next.loans = lRows.map((r, idx) => {
+        const id = String(r[lIdx['Loan ID']] || ('LN_LOCAL_' + (idx + 1))).trim();
+        if (!id) throw new Error('A loan row has no Loan ID.');
+        if (loanIds.has(id)) throw new Error('Duplicate Loan ID: ' + id);
+        loanIds.add(id);
+        return { id, person: String(r[lIdx['Person']] || ''), loanName: String(r[lIdx['Loan Name']] || ''), principalAmount: Number(r[lIdx['Loan Taken']]) || 0, loanAmount: Number(r[lIdx['Loan to Pay']]) || 0, monthlyEmi: Number(r[lIdx['Monthly EMI']]) || 0, tenureMonths: Number(r[lIdx['Tenure Months']]) || 0, firstEmiDate: String(r[lIdx['First EMI Date']] || ''), status: String(r[lIdx['Status']] || 'ACTIVE').toUpperCase(), schedule: [] };
+      });
+
+      const eIdx = Object.fromEntries(LOCAL_HEADERS.emi.map((h, i) => [h, i]));
       const schedules = {};
-      eRows.filter(r => r.some(Boolean)).forEach(r => {
-        const id = String(r[ei('Loan ID')] || '');
-        if (!id) return;
+      const emiKeys = new Set();
+      eRows.forEach(r => {
+        const id = String(r[eIdx['Loan ID']] || '').trim();
+        if (!id) throw new Error('An EMI row has no Loan ID.');
+        if (!loanIds.has(id)) throw new Error('EMI record references unknown Loan ID: ' + id);
+        const emiNo = Number(r[eIdx['EMI No']]) || 0;
+        if (emiNo < 1) throw new Error('Invalid EMI number for Loan ID: ' + id);
+        const key = id + '#' + emiNo;
+        if (emiKeys.has(key)) throw new Error('Duplicate EMI record: ' + key);
+        emiKeys.add(key);
         if (!schedules[id]) schedules[id] = [];
-        schedules[id].push({
-          emiNo: Number(r[ei('EMI No')]) || 0,
-          date: String(r[ei('Date')] || ''),
-          emiAmount: Number(r[ei('EMI Amount')]) || 0,
-          outstandingBal: Number(r[ei('Outstanding Bal')]) || 0,
-          paid: String(r[ei('Paid')] || '').toLowerCase() === 'true',
-          whoPaid: String(r[ei('Who Paid')] || ''),
-          paymentId: String(r[ei('Txn. Id')] || ''),
-          paidDate: String(r[ei('Paid Date')] || '')
-        });
+        schedules[id].push({ emiNo, date: String(r[eIdx['Date']] || ''), emiAmount: Number(r[eIdx['EMI Amount']]) || 0, outstandingBal: Number(r[eIdx['Outstanding Bal']]) || 0, paid: String(r[eIdx['Paid']] || '').trim().toLowerCase() === 'true', whoPaid: String(r[eIdx['Who Paid']] || ''), paymentId: String(r[eIdx['Txn. Id']] || ''), paidDate: String(r[eIdx['Paid Date']] || '') });
       });
       next.loans.forEach(l => { l.schedule = (schedules[l.id] || []).sort((a, b) => a.emiNo - b.emiNo); });
+
+      // All validation is completed before this single write, so a bad backup never partially replaces user data.
       return writeLocalState(next);
     };
 
@@ -2683,6 +2680,36 @@ const INCOME_TYPES = ['INCOME', 'BORROW'];
     });
 
     const AppContext = createContext();
+
+    class AppErrorBoundary extends React.Component {
+      constructor(props) {
+        super(props);
+        this.state = { hasError: false, message: '' };
+      }
+      static getDerivedStateFromError(error) {
+        return { hasError: true, message: String(error && error.message ? error.message : error || 'Unexpected application error') };
+      }
+      componentDidCatch(error, info) {
+        console.error('Budget Bharat render error:', error, info);
+      }
+      handleRetry = () => this.setState({ hasError: false, message: '' });
+      render() {
+        if (!this.state.hasError) return this.props.children;
+        return (
+          <div className="app-shell">
+            <div className="flex-1 flex flex-col items-center justify-center text-center space-y-3 p-6">
+              <i className="fa-solid fa-triangle-exclamation text-3xl text-[#D6455D]"></i>
+              <p className="text-sm font-bold text-[#1E104B]">Budget Bharat recovered from an unexpected error</p>
+              <p className="text-xs text-[#625E70] max-w-sm break-words">{this.state.message}</p>
+              <div className="flex gap-2">
+                <button type="button" onClick={this.handleRetry} className="px-4 py-2 bg-[#1E104B] text-white rounded-xl text-xs font-bold shadow-md">Try Again</button>
+                <button type="button" onClick={() => window.location.reload()} className="px-4 py-2 bg-[#078A87] text-white rounded-xl text-xs font-bold shadow-md">Reload App</button>
+              </div>
+            </div>
+          </div>
+        );
+      }
+    }
 
     const AppProvider = ({ children }) => {
       const [transactions, setTransactions] = useState([]);
@@ -7406,16 +7433,33 @@ const INCOME_TYPES = ['INCOME', 'BORROW'];
 
       useEffect(() => {
         window.__TRIGGER_TAB__ = (targetTab) => {
+          const allowedTabs = new Set(['home', 'people', 'loans', 'records']);
           setSearchQuery('');
+          setSelectedTransaction(null);
+          setSelectedPerson(null);
           setFocusedLoan({ person: null, loanId: null });
-          setTab(targetTab);
+          setViewMode('master');
+          setIsCreatingLoan(false);
+          setTab(allowedTabs.has(targetTab) ? targetTab : 'home');
         };
         window.__TRIGGER_LOAN__ = (personName, loanId) => {
           setSearchQuery('');
+          setSelectedTransaction(null);
+          setSelectedPerson(null);
           setFocusedLoan({ person: personName, loanId: loanId });
+          setViewMode('detail');
+          setIsCreatingLoan(false);
           setTab('loans');
         };
+        return () => {
+          delete window.__TRIGGER_TAB__;
+          delete window.__TRIGGER_LOAN__;
+        };
       }, []);
+
+      useEffect(() => {
+        if (selectedPerson && !persons.some(p => p.name === selectedPerson.name)) setSelectedPerson(null);
+      }, [persons, selectedPerson]);
 
       const fullPersonList = useMemo(() => {
         return persons.map(p => {
@@ -7447,25 +7491,7 @@ const INCOME_TYPES = ['INCOME', 'BORROW'];
 
       if (selectedPerson) {
         const refreshedPerson = fullPersonList.find(p => p.name === selectedPerson.name);
-        if (!refreshedPerson) {
-          return (
-            <div className="app-shell">
-              <div className="flex-1 flex items-center justify-center p-6 text-center">
-                <div>
-                  <i className="fa-solid fa-user-slash text-3xl text-[#625E70]/30 mb-2"></i>
-                  <p className="text-sm font-bold text-theme-dark/60">Person no longer exists</p>
-                  <button
-                    type="button"
-                    onClick={() => setSelectedPerson(null)}
-                    className="mt-3 px-4 py-2 bg-[#1E104B] text-white rounded-xl text-xs font-bold"
-                  >
-                    Back
-                  </button>
-                </div>
-              </div>
-            </div>
-          );
-        }
+        if (!refreshedPerson) return null;
         return (
           <div className="app-shell">
             <LedgerView
@@ -7708,7 +7734,9 @@ const INCOME_TYPES = ['INCOME', 'BORROW'];
     };
 
     createRoot(document.getElementById('root')).render(
-      <AppProvider>
-        <MainApp />
-      </AppProvider>
+      <AppErrorBoundary>
+        <AppProvider>
+          <MainApp />
+        </AppProvider>
+      </AppErrorBoundary>
     );
